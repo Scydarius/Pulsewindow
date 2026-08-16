@@ -1,0 +1,28 @@
+# Local repository-history backups retained during the monorepo conversion
+.nested-git-backups/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# JavaScript
+node_modules/
+.next/
+dist/
+.wrangler/
+*.tsbuildinfo
+
+# Xcode and macOS
+xcuserdata/
+*.xcuserstate
+DerivedData/
+.DS_Store
+
+# Local data and secrets
+*.csv
+.env
+.env.*
+!.env.example
+

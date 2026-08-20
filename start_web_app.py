@@ -11,7 +11,7 @@ import webbrowser
 from pathlib import Path
 
 
-PROJECT_DIR = Path(__file__).resolve().parent / "web-app"
+PROJECT_DIR = Path(__file__).resolve().parent / "patient-app"
 VINEXT_BIN_NAME = "vinext.cmd" if sys.platform == "win32" else "vinext"
 VINEXT = PROJECT_DIR / "node_modules" / ".bin" / VINEXT_BIN_NAME
 

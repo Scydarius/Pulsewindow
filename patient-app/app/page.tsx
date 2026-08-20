@@ -3,6 +3,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FaceDetector, FilesetResolver } from "@mediapipe/tasks-vision";
 import { jsPDF } from "jspdf";
+import JSZip from "jszip";
+import {
+  concatArrayBuffers,
+  importSigningPrivateKeyBase64,
+  isValidPrivateKeyBase64,
+  isValidPublicKeyBase64,
+  signReportBytes,
+} from "./crypto";
 
 type Screen = "start" | "monitor" | "medications" | "history";
 type Camera = { deviceId: string; label: string };
@@ -38,6 +46,8 @@ type FaceBox = { x: number; y: number; width: number; height: number };
 const STORAGE_KEY = "pulse-window-readings";
 const MEDICATIONS_KEY = "pulse-window-medications";
 const DOSES_KEY = "pulse-window-dose-events";
+const PUBLIC_KEY_STORAGE_KEY = "pulse-window-public-key";
+const PRIVATE_KEY_STORAGE_KEY = "pulse-window-private-key";
 const MEDICATION_PRESETS: MedicationPreset[] = [
   {
     id: "sotalol", name: "Sotalol", routineChecks: 2, changeChecks: 3,
@@ -146,6 +156,32 @@ function nearestReadingBefore(
     }
   });
   return best;
+}
+
+type ExportEntry = { path: string; data: ArrayBuffer | string };
+
+function formatDateTimeForFilename(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `_${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`
+  );
+}
+
+// Writes one entry into a real directory tree via the File System Access
+// API, creating any intermediate folders (e.g. "DigitalSignature/hash.txt")
+// as needed.
+async function writeExportEntry(root: FileSystemDirectoryHandle, entry: ExportEntry): Promise<void> {
+  const segments = entry.path.split("/");
+  const fileName = segments.pop()!;
+  let directory = root;
+  for (const segment of segments) {
+    directory = await directory.getDirectoryHandle(segment, { create: true });
+  }
+  const fileHandle = await directory.getFileHandle(fileName, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(entry.data);
+  await writable.close();
 }
 
 function presetForMedicineName(medicineName: string) {
@@ -644,7 +680,7 @@ export default function Home() {
   const [beatSync, setBeatSync] = useState({ age: 0, revision: 0 });
   const [developerMode, setDeveloperMode] = useState(false);
   const [simulatedBpmInput, setSimulatedBpmInput] = useState("");
-  const [simulatedOffsetInput, setSimulatedOffsetInput] = useState("");
+  const [devTimeOffsetInput, setDevTimeOffsetInput] = useState("0");
   const [faceBox, setFaceBox] = useState<FaceBox | null>(null);
   const [readings, setReadings] = useState<Reading[]>([]);
   const [medications, setMedications] = useState<Medication[]>([]);
@@ -656,6 +692,13 @@ export default function Home() {
   const [doseChange, setDoseChange] = useState(false);
   const [selectedPresetId, setSelectedPresetId] = useState("custom");
   const [patientNotice, setPatientNotice] = useState("");
+  const [publicKey, setPublicKey] = useState<string | null>(null);
+  const [privateKey, setPrivateKey] = useState<string | null>(null);
+  const [keysLoaded, setKeysLoaded] = useState(false);
+  const [keySetupPublicInput, setKeySetupPublicInput] = useState("");
+  const [keySetupPrivateInput, setKeySetupPrivateInput] = useState("");
+  const [keySetupError, setKeySetupError] = useState("");
+  const [keySetupSaving, setKeySetupSaving] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const workCanvasRef = useRef<HTMLCanvasElement>(null);
   const diagnosticCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -705,10 +748,43 @@ export default function Home() {
       }
       const storedDoses = localStorage.getItem(DOSES_KEY);
       if (storedDoses) setDoses(JSON.parse(storedDoses));
+
+      setPublicKey(localStorage.getItem(PUBLIC_KEY_STORAGE_KEY));
+      setPrivateKey(localStorage.getItem(PRIVATE_KEY_STORAGE_KEY));
+      setKeysLoaded(true);
     }, 0);
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
     return () => window.clearTimeout(timer);
   }, []);
+
+  const saveKeys = async () => {
+    const nextPublicKey = keySetupPublicInput.trim();
+    const nextPrivateKey = keySetupPrivateInput.trim();
+    if (!nextPublicKey || !nextPrivateKey) {
+      setKeySetupError("Enter both the public key and the private key.");
+      return;
+    }
+    setKeySetupSaving(true);
+    setKeySetupError("");
+    try {
+      const [validPublic, validPrivate] = await Promise.all([
+        isValidPublicKeyBase64(nextPublicKey),
+        isValidPrivateKeyBase64(nextPrivateKey),
+      ]);
+      if (!validPublic || !validPrivate) {
+        setKeySetupError("One or both keys don't look right. Check them against what your clinic gave you.");
+        return;
+      }
+      localStorage.setItem(PUBLIC_KEY_STORAGE_KEY, nextPublicKey);
+      localStorage.setItem(PRIVATE_KEY_STORAGE_KEY, nextPrivateKey);
+      setPublicKey(nextPublicKey);
+      setPrivateKey(nextPrivateKey);
+      setKeySetupPublicInput("");
+      setKeySetupPrivateInput("");
+    } finally {
+      setKeySetupSaving(false);
+    }
+  };
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -828,34 +904,6 @@ export default function Home() {
       return;
     }
     stopCamera();
-
-    // An offset backdates and immediately saves the reading against the most
-    // recent dose, so dose-response stats can be populated in seconds instead
-    // of waiting the real number of minutes between each simulated check.
-    if (simulatedOffsetInput.trim() !== "") {
-      const offsetMinutes = Number(simulatedOffsetInput);
-      if (!Number.isFinite(offsetMinutes)) {
-        setStatus("Enter a whole number of minutes for the dose offset");
-        return;
-      }
-      const lastDose = [...doses].sort(
-        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
-      )[0];
-      if (!lastDose) {
-        setStatus("Log a dose first, then simulate a reading at an offset from it");
-        return;
-      }
-      const targetDate = new Date(new Date(lastDose.timestamp).getTime() + offsetMinutes * 60_000);
-      const context = saveReadingAt(value, targetDate);
-      bpmRef.current = value;
-      setBpm(value);
-      setMonitoring(true);
-      setCalibrationSeconds(null);
-      setBeatSync((current) => ({ age: 0, revision: current.revision + 1 }));
-      setStatus(`Simulated reading saved · ${context}`);
-      return;
-    }
-
     bpmRef.current = value;
     setBpm(value);
     setMonitoring(true);
@@ -1219,8 +1267,16 @@ export default function Home() {
       setStatus("Wait for a confirmed measurement before saving");
       return;
     }
-    const context = saveReadingAt(bpm, new Date());
-    setStatus(`Measurement saved · ${context}`);
+    // devTimeOffsetInput only has a UI to change it in dev mode and defaults
+    // to "0", so this is a no-op for everyone else.
+    const offsetMinutes = Number(devTimeOffsetInput) || 0;
+    const recordedAt = new Date(Date.now() + offsetMinutes * 60_000);
+    const context = saveReadingAt(bpm, recordedAt);
+    setStatus(
+      offsetMinutes
+        ? `Measurement saved · ${context} (offset ${offsetMinutes > 0 ? "+" : ""}${offsetMinutes} min)`
+        : `Measurement saved · ${context}`,
+    );
   };
 
   const navigate = (next: Screen) => {
@@ -1260,7 +1316,7 @@ export default function Home() {
     return { medication, doseCount: medicationDoses.length, offsets };
   });
 
-  const exportCsv = () => {
+  const buildRawDataCsv = () => {
     const rows = [
       "PulseWindow monitoring summary",
       "Wellness estimates only - not a diagnosis or medical record",
@@ -1279,14 +1335,10 @@ export default function Home() {
         return `${date.toLocaleDateString()},${date.toLocaleTimeString()},${dose.medicationName}`;
       }),
     ];
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(new Blob([rows.join("\n")], { type: "text/csv" }));
-    link.download = "pulsewindow-readings.csv";
-    link.click();
-    URL.revokeObjectURL(link.href);
+    return rows.join("\n");
   };
 
-  const exportAnalyticalPdf = () => {
+  const buildAnalyticalReportPdfBytes = (): ArrayBuffer => {
     const graphWidth = 1600;
     const graphHeight = 711;
     const graphCanvas = document.createElement("canvas");
@@ -1431,11 +1483,93 @@ export default function Home() {
       y,
     );
 
-    doc.save("pulsewindow-analytical-summary.pdf");
+    return doc.output("arraybuffer") as ArrayBuffer;
   };
+
+  const exportSignedReport = async () => {
+    if (!publicKey || !privateKey) {
+      setPatientNotice("Set up your verification keys before exporting a report.");
+      return;
+    }
+
+    try {
+      const reportBytes = buildAnalyticalReportPdfBytes();
+      const csvBytes = new TextEncoder().encode(buildRawDataCsv()).buffer;
+      const key = await importSigningPrivateKeyBase64(privateKey);
+      // Sign both files together (report bytes then CSV bytes) so tampering
+      // with either one after export breaks verification, not just the PDF.
+      const signature = await signReportBytes(key, concatArrayBuffers(reportBytes, csvBytes));
+      const entries: ExportEntry[] = [
+        { path: "AnalyticalReport.pdf", data: reportBytes },
+        { path: "Raw data.csv", data: csvBytes },
+        { path: "DigitalSignature/hash.txt", data: signature },
+        { path: "DigitalSignature/public.txt", data: publicKey },
+      ];
+      const folderName = `PulseWindowReporting-${formatDateTimeForFilename(new Date())}`;
+
+      if (typeof window.showDirectoryPicker === "function") {
+        const parentHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+        const rootHandle = await parentHandle.getDirectoryHandle(folderName, { create: true });
+        for (const entry of entries) {
+          await writeExportEntry(rootHandle, entry);
+        }
+        setPatientNotice(`Saved “${folderName}” to the folder you picked.`);
+      } else {
+        const zip = new JSZip();
+        entries.forEach((entry) => zip.file(entry.path, entry.data));
+        const zipBlob = await zip.generateAsync({ type: "blob" });
+        const link = document.createElement("a");
+        link.href = URL.createObjectURL(zipBlob);
+        link.download = `${folderName}.zip`;
+        link.click();
+        URL.revokeObjectURL(link.href);
+        setPatientNotice("Your browser can't save a folder directly, so this downloaded as a .zip instead.");
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      console.error("Could not export the signed report", error);
+      setPatientNotice("Could not export the report — check your saved keys and try again.");
+    }
+  };
+
+  const needsKeySetup = keysLoaded && (!publicKey || !privateKey);
 
   return (
     <main className="app-shell">
+      {needsKeySetup && (
+        <div className="key-setup-overlay" role="dialog" aria-modal="true" aria-label="Set up verification keys">
+          <div className="key-setup-card">
+            <p className="eyebrow">Pulse Window</p>
+            <h1>Set up verification keys</h1>
+            <p className="intro">
+              Your clinic issued a public and private key for this device. Enter both to continue — they let a
+              doctor confirm that an exported summary came from you unaltered.
+            </p>
+            <div className="field">
+              <label htmlFor="key-setup-public">Public key</label>
+              <textarea
+                id="key-setup-public"
+                rows={3}
+                value={keySetupPublicInput}
+                onChange={(event) => setKeySetupPublicInput(event.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="key-setup-private">Private key</label>
+              <textarea
+                id="key-setup-private"
+                rows={5}
+                value={keySetupPrivateInput}
+                onChange={(event) => setKeySetupPrivateInput(event.target.value)}
+              />
+            </div>
+            {keySetupError && <p className="key-setup-error" role="alert">{keySetupError}</p>}
+            <button className="primary" onClick={saveKeys} disabled={keySetupSaving}>
+              {keySetupSaving ? "Checking…" : "Save and continue"}
+            </button>
+          </div>
+        </div>
+      )}
       {screen === "start" && (
         <section className="dashboard-screen">
           <header className="dashboard-header">
@@ -1598,14 +1732,18 @@ export default function Home() {
                 />
                 <button className="secondary compact" onClick={applySimulatedBpm}>Simulate</button>
               </div>
-              <label htmlFor="simulate-offset">Minutes after most recent dose (optional — saves immediately)</label>
+              <label htmlFor="dev-time-offset">Time offset (minutes)</label>
               <input
-                id="simulate-offset"
+                id="dev-time-offset"
                 type="number"
-                placeholder="e.g. 30"
-                value={simulatedOffsetInput}
-                onChange={(event) => setSimulatedOffsetInput(event.target.value)}
+                step={1}
+                value={devTimeOffsetInput}
+                onChange={(event) => setDevTimeOffsetInput(event.target.value)}
               />
+              <p className="helper">
+                Added to the current time when you hit “Save measurement” below — e.g. set to 30 to record the
+                next save as 30 minutes from now, without waiting.
+              </p>
             </div>
           )}
         </section>
@@ -1725,8 +1863,7 @@ export default function Home() {
             </div>
             <HistoryGraph readings={readings} doses={doses} />
             <div className="export-actions">
-              <button className="secondary" onClick={exportCsv}>Raw CSV export</button>
-              <button className="secondary" onClick={exportAnalyticalPdf}>Analytical summary (PDF)</button>
+              <button className="secondary" onClick={exportSignedReport}>Export report</button>
             </div>
             <div className="graph-heading">
               <strong>Every measurement</strong>

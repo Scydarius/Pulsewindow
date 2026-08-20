@@ -1,19 +1,20 @@
 # PulseWindow
 
-PulseWindow is a wellness prototype that estimates pulse rate from small colour changes in facial skin captured by a camera. It includes a web app and a native iPhone app, along with medication reminders and a pulse-and-medication history timeline.
+PulseWindow is a wellness prototype that estimates pulse rate from small colour changes in facial skin captured by a camera. It includes a patient-facing web app, a doctor portal, and a native iPhone app, along with medication reminders and a pulse-and-medication history timeline.
 
 > PulseWindow is not a medical device and must not be used for diagnosis, emergencies, or medication changes. Follow instructions from a qualified clinician or pharmacist.
 
 ## Project folders
 
-- `web-app/` — browser version for desktop and mobile browsers
+- `patient-app/` — browser version for desktop and mobile browsers; where patients monitor pulse, log medications, and export summaries
+- `doctor-portal/` — separate app for clinicians; issues signed keys and verifies exported summaries
 - `PulseWindow/` — native SwiftUI iPhone application
-- `start_web_app.py` — simple local web-app launcher
+- `start_web_app.py` — simple local launcher for the patient app
 
-## Run the web app
+## Run the patient app
 
 ```bash
-cd web-app
+cd patient-app
 npm install
 npm run dev
 ```
@@ -29,12 +30,41 @@ monitor screen for entering a BPM value by hand, so the rest of the app
 camera:
 
 ```bash
-cd web-app
+cd patient-app
 VITE_DEV_MODE=true npm run dev
 ```
 
 This flag is read once at startup and defaults to off, so it never appears
 for normal users of a deployed build.
+
+## Run the doctor portal
+
+```bash
+cd doctor-portal
+npm install
+npm run dev
+```
+
+Then open `http://localhost:3000` (or the next free port if the patient app is already running).
+
+### Report verification
+
+The two apps share a simple signing scheme (ECDSA P-256) so a doctor can confirm a patient's exported summary wasn't altered after it left their device:
+
+1. In the doctor portal, under **Issue certification**, enter the patient's name and date of birth. This generates a key pair, saves the patient's name/DOB/ID and *public* key to a registry (kept in the browser, exportable as CSV), and displays both keys once for you to copy.
+2. Give the patient their public and private key. The first time they open the patient app, it prompts for both before anything else is usable.
+3. When the patient clicks **Export report**, they get a `PulseWindowReporting-<date>-<time>` folder containing:
+   ```
+   AnalyticalReport.pdf
+   Raw data.csv
+   DigitalSignature/
+     hash.txt      (a signature over AnalyticalReport.pdf + Raw data.csv together)
+     public.txt
+   ```
+   In a browser that supports the File System Access API (Chrome, Edge), this is written as a real folder wherever they choose. Elsewhere, it downloads as a `.zip` with the same layout.
+4. In the doctor portal, under **Verify a report**, select that folder. The portal matches the public key against the registry to identify the patient, then checks the signature against the report.
+
+The private key is never stored by the portal — only shown once at issuance — and the app only vouches for "this file is unmodified since export," not for the truthfulness of the underlying readings.
 
 ## Run the iPhone app
 

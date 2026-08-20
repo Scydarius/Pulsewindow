@@ -1,0 +1,95 @@
+@import "tailwindcss";
+
+:root {
+  --ink: #17332a;
+  --muted: #65756e;
+  --green: #19764a;
+  --green-dark: #105c39;
+  --cream: #f3f6f2;
+  --paper: #ffffff;
+  --line: #dce7e2;
+  --red: #dd3d42;
+}
+
+* { box-sizing: border-box; }
+html { background: var(--cream); }
+body {
+  margin: 0;
+  background: var(--cream);
+  color: var(--ink);
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 17px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+button, select, input { font: inherit; }
+button { cursor: pointer; }
+button:focus-visible, select:focus-visible, input:focus-visible {
+  outline: 4px solid rgba(25, 118, 74, .28);
+  outline-offset: 3px;
+}
+
+.portal-page { min-height: 100svh; padding: 34px 20px 80px; }
+.portal-content { width: min(100%, 720px); margin: 0 auto; display: grid; gap: 20px; }
+.portal-header h1 { margin: 0 0 10px; font-size: clamp(28px, 5vw, 40px); letter-spacing: -.03em; }
+.eyebrow {
+  margin: 0 0 8px;
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.intro { margin: 0; color: var(--muted); font-size: 17px; line-height: 1.5; }
+
+.portal-card {
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: var(--paper);
+  box-shadow: 0 14px 36px rgba(23, 51, 42, .055);
+}
+.portal-card h2 { margin: 0 0 6px; font-size: 22px; }
+.helper { color: var(--muted); font-size: 15px; line-height: 1.5; margin: 4px 0 14px; }
+
+.field { margin-bottom: 14px; }
+.field label { display: block; margin-bottom: 7px; font-size: 14px; font-weight: 800; }
+.field input, .field textarea {
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid #c7d4ce;
+  border-radius: 13px;
+  color: var(--ink);
+  background: white;
+  font-family: inherit;
+}
+.field textarea { resize: vertical; font-family: ui-monospace, monospace; font-size: 13px; word-break: break-all; }
+
+button.primary, button.secondary {
+  min-height: 48px;
+  padding: 0 18px;
+  border-radius: 13px;
+  border: 1px solid transparent;
+  font-weight: 800;
+}
+button.primary { color: white; background: var(--green); }
+button.primary:hover:not(:disabled) { background: var(--green-dark); }
+button.secondary { color: var(--ink); background: white; border-color: #cbd7d2; }
+button.compact { min-height: 40px; padding: 0 14px; font-size: 13px; }
+button:disabled { opacity: .55; cursor: not-allowed; }
+
+.issued-keys { margin-top: 18px; padding-top: 18px; border-top: 1px dashed var(--line); }
+.issued-keys .field button { margin-top: 8px; }
+
+.button-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+
+.registry-table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 14px; }
+.registry-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.registry-table th, .registry-table td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--line); }
+.registry-table thead { background: #f2f6f3; }
+.registry-table tr:last-child td { border-bottom: 0; }
+
+.verify-result { margin-top: 16px; padding: 14px 16px; border-radius: 14px; border: 1px solid var(--line); }
+.verify-result p { margin: 4px 0 0; }
+.verify-valid { background: #eaf6ef; border-color: #b6dac7; color: var(--green-dark); }
+.verify-invalid, .verify-unknown, .verify-error { background: #fdecec; border-color: #f2c1c1; color: #8a2328; }

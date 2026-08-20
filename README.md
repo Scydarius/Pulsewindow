@@ -20,6 +20,22 @@ npm run dev
 
 Then open `http://localhost:3000`.
 
+### Dev mode
+
+Camera hardware isn't always available (or working) while developing. Starting
+the server with `VITE_DEV_MODE=true` adds a developer-only panel to the
+monitor screen for entering a BPM value by hand, so the rest of the app
+(saving readings, history, medication reminders) can be exercised without a
+camera:
+
+```bash
+cd web-app
+VITE_DEV_MODE=true npm run dev
+```
+
+This flag is read once at startup and defaults to off, so it never appears
+for normal users of a deployed build.
+
 ## Run the iPhone app
 
 Open `PulseWindow/PulseWindow.xcodeproj` in Xcode, select a signed development team and an iPhone run destination, then press Run.

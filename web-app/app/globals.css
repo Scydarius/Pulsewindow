@@ -239,7 +239,8 @@ button.compact { width: auto; min-height: 46px; margin: 0; padding: 0 14px; font
 .empty-card > span { font-size: 34px; }
 .empty-card h3 { margin: 8px 0 4px; }
 .empty-card p { margin: 0; color: var(--muted); }
-.export-button { margin-top: 18px; }
+.export-actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+.export-actions button { flex: 1 1 200px; }
 .saved-time small { color: #8a5a25; font-size: 12px; }
 
 .monitor-screen, .history-screen { min-height: 100svh; padding-bottom: 28px; }
@@ -442,6 +443,7 @@ button.compact { width: auto; min-height: 46px; margin: 0; padding: 0 14px; font
   .medications-content { padding-top: 24px; }
   .add-medicine-content { padding: 0 12px 12px; }
   .medicine-form, .preset-panel { padding: 17px; }
+  .export-actions button { flex-basis: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {

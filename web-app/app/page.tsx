@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FaceDetector, FilesetResolver } from "@mediapipe/tasks-vision";
+import { jsPDF } from "jspdf";
 
 type Screen = "start" | "monitor" | "medications" | "history";
 type Camera = { deviceId: string; label: string };
@@ -101,6 +102,51 @@ const REGION_AGREEMENT_BPM = 10;
 // tools (e.g. simulating a BPM reading without a camera). Off by default so it
 // never ships to real users.
 const DEV_MODE = import.meta.env.VITE_DEV_MODE === "true";
+
+const RECENT_READINGS_COUNT = 20;
+const DOSE_RESPONSE_OFFSETS_MINUTES = [15, 30, 45, 60];
+const DOSE_BASELINE_WINDOW_MINUTES = 45;
+const DOSE_RESPONSE_TOLERANCE_MINUTES = 15;
+
+// Closest reading to targetTime, within toleranceMinutes either side.
+function nearestReadingWithin(
+  readings: Reading[],
+  targetTime: number,
+  toleranceMinutes: number,
+): Reading | null {
+  const toleranceMs = toleranceMinutes * 60_000;
+  let best: Reading | null = null;
+  let bestDiff = Infinity;
+  readings.forEach((reading) => {
+    const diff = Math.abs(new Date(reading.timestamp).getTime() - targetTime);
+    if (diff <= toleranceMs && diff < bestDiff) {
+      best = reading;
+      bestDiff = diff;
+    }
+  });
+  return best;
+}
+
+// Closest reading at or before doseTime, within windowMinutes beforehand —
+// used as the pre-dose baseline, so a later reading can never be mistaken
+// for "before the dose".
+function nearestReadingBefore(
+  readings: Reading[],
+  doseTime: number,
+  windowMinutes: number,
+): Reading | null {
+  const windowMs = windowMinutes * 60_000;
+  let best: Reading | null = null;
+  let bestDiff = Infinity;
+  readings.forEach((reading) => {
+    const diff = doseTime - new Date(reading.timestamp).getTime();
+    if (diff >= 0 && diff <= windowMs && diff < bestDiff) {
+      best = reading;
+      bestDiff = diff;
+    }
+  });
+  return best;
+}
 
 function presetForMedicineName(medicineName: string) {
   const name = medicineName.toLowerCase();
@@ -440,15 +486,131 @@ function drawGreenDiagnostic(
   return baseline;
 }
 
+function drawPulseGraph(
+  context: CanvasRenderingContext2D,
+  width: number,
+  height: number,
+  readings: Reading[],
+  doses: DoseEvent[],
+) {
+  context.clearRect(0, 0, width, height);
+  if (!readings.length) return;
+  const ordered = [...readings].sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+  );
+
+  const values = ordered.map((reading) => reading.bpm);
+  const times = ordered.map((reading) => new Date(reading.timestamp).getTime());
+  const timeStart = Math.min(...times);
+  const timeEnd = Math.max(...times);
+  const timeSpan = Math.max(1, timeEnd - timeStart);
+  const low = Math.min(...values);
+  const high = Math.max(...values);
+  const valueSpan = Math.max(30, high - low + 20);
+  const middle = (low + high) / 2;
+  const yMin = Math.max(30, middle - valueSpan / 2);
+  const yMax = Math.min(200, middle + valueSpan / 2);
+  const margin = { left: 48, right: 20, top: 22, bottom: 50 };
+  const plotWidth = width - margin.left - margin.right;
+  const plotHeight = height - margin.top - margin.bottom;
+  const x = (index: number) =>
+    ordered.length === 1
+      ? margin.left + plotWidth / 2
+      : margin.left + ((times[index] - timeStart) / timeSpan) * plotWidth;
+  const y = (value: number) =>
+    margin.top + ((yMax - value) * plotHeight) / (yMax - yMin);
+
+  doses.forEach((dose) => {
+    const doseTime = new Date(dose.timestamp).getTime();
+    if (doseTime < timeStart || doseTime > timeEnd) return;
+    const doseX = margin.left + ((doseTime - timeStart) / timeSpan) * plotWidth;
+    context.save();
+    context.setLineDash([5, 4]);
+    context.strokeStyle = "#d77a21";
+    context.lineWidth = 2;
+    context.beginPath();
+    context.moveTo(doseX, margin.top);
+    context.lineTo(doseX, margin.top + plotHeight);
+    context.stroke();
+    context.restore();
+    context.fillStyle = "#75400d";
+    context.font = "bold 11px system-ui";
+    context.textAlign = "left";
+    context.fillText(`💊 ${dose.medicationName}`, Math.min(doseX + 4, width - 100), margin.top + 4);
+  });
+
+  context.font = "12px system-ui";
+  context.textAlign = "right";
+  context.textBaseline = "middle";
+  for (let index = 0; index < 5; index += 1) {
+    const value = yMin + (index * (yMax - yMin)) / 4;
+    const rowY = y(value);
+    context.strokeStyle = "#dce7e2";
+    context.beginPath();
+    context.moveTo(margin.left, rowY);
+    context.lineTo(width - margin.right, rowY);
+    context.stroke();
+    context.fillStyle = "#607069";
+    context.fillText(value.toFixed(0), margin.left - 9, rowY);
+  }
+
+  const axisFormatter = new Intl.DateTimeFormat(undefined, timeSpan < 86_400_000
+    ? { hour: "numeric", minute: "2-digit" }
+    : { month: "short", day: "numeric" });
+  context.textBaseline = "top";
+  for (let tick = 0; tick < 3; tick += 1) {
+    const fraction = tick / 2;
+    const tickX = margin.left + fraction * plotWidth;
+    const tickTime = ordered.length === 1 ? times[0] : timeStart + fraction * timeSpan;
+    context.strokeStyle = "#edf2ef";
+    context.beginPath();
+    context.moveTo(tickX, margin.top);
+    context.lineTo(tickX, margin.top + plotHeight);
+    context.stroke();
+    context.fillStyle = "#607069";
+    context.textAlign = tick === 0 ? "left" : tick === 2 ? "right" : "center";
+    context.fillText(axisFormatter.format(new Date(tickTime)), tickX, height - 28);
+  }
+
+  if (ordered.length > 1) {
+    const gradient = context.createLinearGradient(0, margin.top, 0, margin.top + plotHeight);
+    gradient.addColorStop(0, "rgba(25, 118, 74, .20)");
+    gradient.addColorStop(1, "rgba(25, 118, 74, 0)");
+    context.beginPath();
+    values.forEach((value, index) => {
+      if (index === 0) context.moveTo(x(index), y(value));
+      else context.lineTo(x(index), y(value));
+    });
+    context.lineTo(x(values.length - 1), margin.top + plotHeight);
+    context.lineTo(x(0), margin.top + plotHeight);
+    context.closePath();
+    context.fillStyle = gradient;
+    context.fill();
+
+    context.strokeStyle = "#19764a";
+    context.lineWidth = 3;
+    context.lineJoin = "round";
+    context.beginPath();
+    values.forEach((value, index) => {
+      if (index === 0) context.moveTo(x(index), y(value));
+      else context.lineTo(x(index), y(value));
+    });
+    context.stroke();
+  }
+  values.forEach((value, index) => {
+    context.fillStyle = index === values.length - 1 ? "#df3b3b" : "#19764a";
+    context.beginPath();
+    context.arc(x(index), y(value), 5, 0, 2 * Math.PI);
+    context.fill();
+  });
+}
+
 function HistoryGraph({ readings, doses }: { readings: Reading[]; doses: DoseEvent[] }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !readings.length) return;
-    const ordered = [...readings].sort(
-      (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
-    );
 
     const draw = () => {
       const ratio = window.devicePixelRatio || 1;
@@ -458,112 +620,7 @@ function HistoryGraph({ readings, doses }: { readings: Reading[]; doses: DoseEve
       canvas.height = height * ratio;
       const context = canvas.getContext("2d")!;
       context.scale(ratio, ratio);
-      context.clearRect(0, 0, width, height);
-
-      const values = ordered.map((reading) => reading.bpm);
-      const times = ordered.map((reading) => new Date(reading.timestamp).getTime());
-      const timeStart = Math.min(...times);
-      const timeEnd = Math.max(...times);
-      const timeSpan = Math.max(1, timeEnd - timeStart);
-      const low = Math.min(...values);
-      const high = Math.max(...values);
-      const valueSpan = Math.max(30, high - low + 20);
-      const middle = (low + high) / 2;
-      const yMin = Math.max(30, middle - valueSpan / 2);
-      const yMax = Math.min(200, middle + valueSpan / 2);
-      const margin = { left: 48, right: 20, top: 22, bottom: 50 };
-      const plotWidth = width - margin.left - margin.right;
-      const plotHeight = height - margin.top - margin.bottom;
-      const x = (index: number) =>
-        ordered.length === 1
-          ? margin.left + plotWidth / 2
-          : margin.left + ((times[index] - timeStart) / timeSpan) * plotWidth;
-      const y = (value: number) =>
-        margin.top + ((yMax - value) * plotHeight) / (yMax - yMin);
-
-      doses.forEach((dose) => {
-        const doseTime = new Date(dose.timestamp).getTime();
-        if (doseTime < timeStart || doseTime > timeEnd) return;
-        const doseX = margin.left + ((doseTime - timeStart) / timeSpan) * plotWidth;
-        context.save();
-        context.setLineDash([5, 4]);
-        context.strokeStyle = "#d77a21";
-        context.lineWidth = 2;
-        context.beginPath();
-        context.moveTo(doseX, margin.top);
-        context.lineTo(doseX, margin.top + plotHeight);
-        context.stroke();
-        context.restore();
-        context.fillStyle = "#75400d";
-        context.font = "bold 11px system-ui";
-        context.textAlign = "left";
-        context.fillText(`💊 ${dose.medicationName}`, Math.min(doseX + 4, width - 100), margin.top + 4);
-      });
-
-      context.font = "12px system-ui";
-      context.textAlign = "right";
-      context.textBaseline = "middle";
-      for (let index = 0; index < 5; index += 1) {
-        const value = yMin + (index * (yMax - yMin)) / 4;
-        const rowY = y(value);
-        context.strokeStyle = "#dce7e2";
-        context.beginPath();
-        context.moveTo(margin.left, rowY);
-        context.lineTo(width - margin.right, rowY);
-        context.stroke();
-        context.fillStyle = "#607069";
-        context.fillText(value.toFixed(0), margin.left - 9, rowY);
-      }
-
-      const axisFormatter = new Intl.DateTimeFormat(undefined, timeSpan < 86_400_000
-        ? { hour: "numeric", minute: "2-digit" }
-        : { month: "short", day: "numeric" });
-      context.textBaseline = "top";
-      for (let tick = 0; tick < 3; tick += 1) {
-        const fraction = tick / 2;
-        const tickX = margin.left + fraction * plotWidth;
-        const tickTime = ordered.length === 1 ? times[0] : timeStart + fraction * timeSpan;
-        context.strokeStyle = "#edf2ef";
-        context.beginPath();
-        context.moveTo(tickX, margin.top);
-        context.lineTo(tickX, margin.top + plotHeight);
-        context.stroke();
-        context.fillStyle = "#607069";
-        context.textAlign = tick === 0 ? "left" : tick === 2 ? "right" : "center";
-        context.fillText(axisFormatter.format(new Date(tickTime)), tickX, height - 28);
-      }
-
-      if (ordered.length > 1) {
-        const gradient = context.createLinearGradient(0, margin.top, 0, margin.top + plotHeight);
-        gradient.addColorStop(0, "rgba(25, 118, 74, .20)");
-        gradient.addColorStop(1, "rgba(25, 118, 74, 0)");
-        context.beginPath();
-        values.forEach((value, index) => {
-          if (index === 0) context.moveTo(x(index), y(value));
-          else context.lineTo(x(index), y(value));
-        });
-        context.lineTo(x(values.length - 1), margin.top + plotHeight);
-        context.lineTo(x(0), margin.top + plotHeight);
-        context.closePath();
-        context.fillStyle = gradient;
-        context.fill();
-
-        context.strokeStyle = "#19764a";
-        context.lineWidth = 3;
-        context.lineJoin = "round";
-        context.beginPath();
-        values.forEach((value, index) => {
-          if (index === 0) context.moveTo(x(index), y(value));
-          else context.lineTo(x(index), y(value));
-        });
-        context.stroke();
-      }
-      values.forEach((value, index) => {
-        context.fillStyle = index === values.length - 1 ? "#df3b3b" : "#19764a";
-        context.beginPath();
-        context.arc(x(index), y(value), 5, 0, 2 * Math.PI);
-        context.fill();
-      });
+      drawPulseGraph(context, width, height, readings, doses);
     };
 
     draw();
@@ -587,6 +644,7 @@ export default function Home() {
   const [beatSync, setBeatSync] = useState({ age: 0, revision: 0 });
   const [developerMode, setDeveloperMode] = useState(false);
   const [simulatedBpmInput, setSimulatedBpmInput] = useState("");
+  const [simulatedOffsetInput, setSimulatedOffsetInput] = useState("");
   const [faceBox, setFaceBox] = useState<FaceBox | null>(null);
   const [readings, setReadings] = useState<Reading[]>([]);
   const [medications, setMedications] = useState<Medication[]>([]);
@@ -770,6 +828,34 @@ export default function Home() {
       return;
     }
     stopCamera();
+
+    // An offset backdates and immediately saves the reading against the most
+    // recent dose, so dose-response stats can be populated in seconds instead
+    // of waiting the real number of minutes between each simulated check.
+    if (simulatedOffsetInput.trim() !== "") {
+      const offsetMinutes = Number(simulatedOffsetInput);
+      if (!Number.isFinite(offsetMinutes)) {
+        setStatus("Enter a whole number of minutes for the dose offset");
+        return;
+      }
+      const lastDose = [...doses].sort(
+        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
+      )[0];
+      if (!lastDose) {
+        setStatus("Log a dose first, then simulate a reading at an offset from it");
+        return;
+      }
+      const targetDate = new Date(new Date(lastDose.timestamp).getTime() + offsetMinutes * 60_000);
+      const context = saveReadingAt(value, targetDate);
+      bpmRef.current = value;
+      setBpm(value);
+      setMonitoring(true);
+      setCalibrationSeconds(null);
+      setBeatSync((current) => ({ age: 0, revision: current.revision + 1 }));
+      setStatus(`Simulated reading saved · ${context}`);
+      return;
+    }
+
     bpmRef.current = value;
     setBpm(value);
     setMonitoring(true);
@@ -1112,23 +1198,28 @@ export default function Home() {
     return `${Math.abs(hours).toFixed(1)} h ${hours >= 0 ? "after" : "before"} ${nearest.medicationName}`;
   };
 
-  const saveReading = () => {
-    if (bpm === null) {
-      setStatus("Wait for a confirmed measurement before saving");
-      return;
-    }
-    const context = readingContext(new Date());
+  const saveReadingAt = (bpmValue: number, date: Date) => {
+    const context = readingContext(date);
     const next = [
       ...readings,
       {
         id: crypto.randomUUID(),
-        bpm: Math.round(bpm * 10) / 10,
-        timestamp: new Date().toISOString(),
+        bpm: Math.round(bpmValue * 10) / 10,
+        timestamp: date.toISOString(),
         context,
       },
     ];
     setReadings(next);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    return context;
+  };
+
+  const saveReading = () => {
+    if (bpm === null) {
+      setStatus("Wait for a confirmed measurement before saving");
+      return;
+    }
+    const context = saveReadingAt(bpm, new Date());
     setStatus(`Measurement saved · ${context}`);
   };
 
@@ -1140,7 +1231,36 @@ export default function Home() {
   const values = readings.map((reading) => reading.bpm);
   const average = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
 
-  const exportSummary = () => {
+  const recentReadings = [...readings]
+    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+    .slice(0, RECENT_READINGS_COUNT);
+
+  const medicationResponses = medications.map((medication) => {
+    const medicationDoses = doses.filter((dose) => dose.medicationId === medication.id);
+    const offsets = DOSE_RESPONSE_OFFSETS_MINUTES.map((offsetMinutes) => {
+      const reductions: number[] = [];
+      medicationDoses.forEach((dose) => {
+        const doseTime = new Date(dose.timestamp).getTime();
+        const baseline = nearestReadingBefore(readings, doseTime, DOSE_BASELINE_WINDOW_MINUTES);
+        const followUp = nearestReadingWithin(
+          readings,
+          doseTime + offsetMinutes * 60_000,
+          DOSE_RESPONSE_TOLERANCE_MINUTES,
+        );
+        if (baseline && followUp) reductions.push(baseline.bpm - followUp.bpm);
+      });
+      return {
+        offsetMinutes,
+        sampleSize: reductions.length,
+        averageReduction: reductions.length
+          ? reductions.reduce((sum, value) => sum + value, 0) / reductions.length
+          : null,
+      };
+    });
+    return { medication, doseCount: medicationDoses.length, offsets };
+  });
+
+  const exportCsv = () => {
     const rows = [
       "PulseWindow monitoring summary",
       "Wellness estimates only - not a diagnosis or medical record",
@@ -1161,9 +1281,157 @@ export default function Home() {
     ];
     const link = document.createElement("a");
     link.href = URL.createObjectURL(new Blob([rows.join("\n")], { type: "text/csv" }));
-    link.download = "pulsewindow-summary.csv";
+    link.download = "pulsewindow-readings.csv";
     link.click();
     URL.revokeObjectURL(link.href);
+  };
+
+  const exportAnalyticalPdf = () => {
+    const graphWidth = 1600;
+    const graphHeight = 711;
+    const graphCanvas = document.createElement("canvas");
+    graphCanvas.width = graphWidth;
+    graphCanvas.height = graphHeight;
+    const graphContext = graphCanvas.getContext("2d")!;
+    graphContext.fillStyle = "#ffffff";
+    graphContext.fillRect(0, 0, graphWidth, graphHeight);
+    drawPulseGraph(graphContext, graphWidth, graphHeight, recentReadings, doses);
+    const graphImage = graphCanvas.toDataURL("image/png");
+
+    const doc = new jsPDF({ unit: "mm", format: "a4" });
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    const margin = 15;
+    const contentWidth = pageWidth - margin * 2;
+    let y = margin;
+
+    const addPageIfNeeded = (rowsNeeded: number) => {
+      if (y + rowsNeeded > pageHeight - margin) {
+        doc.addPage();
+        y = margin;
+      }
+    };
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(18);
+    doc.setTextColor(20);
+    doc.text("PulseWindow — analytical summary", margin, y);
+    y += 7;
+
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(10);
+    doc.setTextColor(110);
+    doc.text(
+      `Generated ${new Date().toLocaleString()} · wellness estimates only, not a medical record`,
+      margin,
+      y,
+    );
+    doc.setTextColor(20);
+    y += 10;
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.text(`Recent readings (last ${recentReadings.length})`, margin, y);
+    y += 4;
+
+    if (recentReadings.length) {
+      const imageHeight = (contentWidth * graphHeight) / graphWidth;
+      doc.addImage(graphImage, "PNG", margin, y, contentWidth, imageHeight);
+      y += imageHeight + 10;
+    } else {
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(11);
+      doc.text("No measurements saved yet.", margin, y + 6);
+      y += 14;
+    }
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.text("Overview", margin, y);
+    y += 7;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(11);
+    if (readings.length) {
+      doc.text(`Average heart rate: ${average.toFixed(0)} BPM`, margin, y);
+      y += 6;
+      doc.text(`Measurements: ${readings.length}`, margin, y);
+      y += 6;
+      doc.text(`Range: ${Math.min(...values).toFixed(0)}–${Math.max(...values).toFixed(0)} BPM`, margin, y);
+      y += 10;
+    } else {
+      doc.text("No measurements saved yet.", margin, y);
+      y += 10;
+    }
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.text("Response to medication", margin, y);
+    y += 6;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(110);
+    doc.text("Change in BPM vs. the reading before each dose.", margin, y);
+    y += 9;
+    doc.setTextColor(20);
+
+    if (!medications.length) {
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(11);
+      doc.text("No medicines added yet.", margin, y);
+      y += 8;
+    }
+
+    medicationResponses.forEach(({ medication, doseCount, offsets }) => {
+      addPageIfNeeded(26);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(12);
+      doc.text(`${medication.name} — ${doseCount} dose${doseCount === 1 ? "" : "s"} logged`, margin, y);
+      y += 6;
+
+      if (doseCount === 0) {
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(10);
+        doc.setTextColor(110);
+        doc.text("Log a dose to see its effect on pulse rate here.", margin + 2, y);
+        doc.setTextColor(20);
+        y += 10;
+        return;
+      }
+
+      const columnWidth = contentWidth / offsets.length;
+      offsets.forEach(({ offsetMinutes, averageReduction, sampleSize }, index) => {
+        const columnX = margin + index * columnWidth;
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(10);
+        doc.text(`${offsetMinutes} min`, columnX, y);
+        doc.setFont("helvetica", "normal");
+        doc.setFontSize(9);
+        const change = averageReduction === null ? null : -averageReduction;
+        const changeText = change === null
+          ? "no data"
+          : `${change > 0 ? "+" : "-"}${Math.abs(change).toFixed(1)} bpm`;
+        doc.text(changeText, columnX, y + 5);
+        if (change !== null) {
+          doc.setFontSize(7.5);
+          doc.setTextColor(110);
+          doc.text(`n=${sampleSize}`, columnX, y + 9.5);
+          doc.setTextColor(20);
+        }
+      });
+      y += 15;
+    });
+
+    addPageIfNeeded(10);
+    doc.setFont("helvetica", "italic");
+    doc.setFontSize(8);
+    doc.setTextColor(110);
+    doc.text(
+      "Review estimates with a qualified healthcare professional. Do not change medication based on this app alone.",
+      margin,
+      y,
+    );
+
+    doc.save("pulsewindow-analytical-summary.pdf");
   };
 
   return (
@@ -1330,6 +1598,14 @@ export default function Home() {
                 />
                 <button className="secondary compact" onClick={applySimulatedBpm}>Simulate</button>
               </div>
+              <label htmlFor="simulate-offset">Minutes after most recent dose (optional — saves immediately)</label>
+              <input
+                id="simulate-offset"
+                type="number"
+                placeholder="e.g. 30"
+                value={simulatedOffsetInput}
+                onChange={(event) => setSimulatedOffsetInput(event.target.value)}
+              />
             </div>
           )}
         </section>
@@ -1448,6 +1724,13 @@ export default function Home() {
               <span>Pulse rate (BPM)</span>
             </div>
             <HistoryGraph readings={readings} doses={doses} />
+            <div className="export-actions">
+              <button className="secondary" onClick={exportCsv}>Raw CSV export</button>
+              <button className="secondary" onClick={exportAnalyticalPdf}>Analytical summary (PDF)</button>
+            </div>
+            <div className="graph-heading">
+              <strong>Every measurement</strong>
+            </div>
             <div className="reading-list">
               {[...readings]
                 .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
@@ -1472,7 +1755,6 @@ export default function Home() {
                 </article>
               ))}
             </div>
-            <button className="secondary export-button" onClick={exportSummary}>Export clinician summary</button>
             <p className="disclaimer">Review estimates with a qualified healthcare professional. Do not change medication based on this app alone.</p>
           </div>
           <nav className="dashboard-nav" aria-label="Main navigation">

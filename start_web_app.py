@@ -12,7 +12,8 @@ from pathlib import Path
 
 
 PROJECT_DIR = Path(__file__).resolve().parent / "web-app"
-VITE = PROJECT_DIR / "node_modules" / ".bin" / "vite"
+VINEXT_BIN_NAME = "vinext.cmd" if sys.platform == "win32" else "vinext"
+VINEXT = PROJECT_DIR / "node_modules" / ".bin" / VINEXT_BIN_NAME
 
 
 def available_port(start: int = 3000, attempts: int = 20) -> int:
@@ -39,7 +40,7 @@ def wait_until_ready(url: str, process: subprocess.Popen[bytes]) -> bool:
 
 
 def main() -> None:
-    if not VITE.exists():
+    if not VINEXT.exists():
         print("The web app needs to be prepared first.")
         print(f"Open Terminal in {PROJECT_DIR} and run: npm install")
         raise SystemExit(1)
@@ -50,7 +51,7 @@ def main() -> None:
     print(f"Local link: {url}", flush=True)
     print("Keep this Terminal window open. Press Control-C to stop.\n", flush=True)
     process = subprocess.Popen(
-        [str(VITE), "--host", "127.0.0.1", "--port", str(port), "--strictPort"],
+        [str(VINEXT), "dev", "--hostname", "127.0.0.1", "--port", str(port)],
         cwd=PROJECT_DIR,
     )
     try:

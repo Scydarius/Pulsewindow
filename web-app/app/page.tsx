@@ -97,6 +97,11 @@ const INITIAL_CALIBRATION_SECONDS = 15;
 const SIGNAL_WINDOW_SECONDS = 20;
 const REGION_AGREEMENT_BPM = 10;
 
+// Set VITE_DEV_MODE=true when starting the dev server to enable developer-only
+// tools (e.g. simulating a BPM reading without a camera). Off by default so it
+// never ships to real users.
+const DEV_MODE = import.meta.env.VITE_DEV_MODE === "true";
+
 function presetForMedicineName(medicineName: string) {
   const name = medicineName.toLowerCase();
   if (name.includes("sotalol")) return MEDICATION_PRESETS.find((item) => item.id === "sotalol");
@@ -581,6 +586,7 @@ export default function Home() {
   const [calibrationSeconds, setCalibrationSeconds] = useState<number | null>(null);
   const [beatSync, setBeatSync] = useState({ age: 0, revision: 0 });
   const [developerMode, setDeveloperMode] = useState(false);
+  const [simulatedBpmInput, setSimulatedBpmInput] = useState("");
   const [faceBox, setFaceBox] = useState<FaceBox | null>(null);
   const [readings, setReadings] = useState<Reading[]>([]);
   const [medications, setMedications] = useState<Medication[]>([]);
@@ -704,8 +710,18 @@ export default function Home() {
   const findCameras = useCallback(async () => {
     try {
       return await enumerateCameras(true);
-    } catch {
-      setStatus("Allow camera access to show camera names");
+    } catch (error) {
+      console.error("Camera permission request failed", error);
+      const name = error instanceof DOMException ? error.name : "UnknownError";
+      const reason =
+        name === "NotAllowedError"
+          ? "Camera access is blocked for this site. Check your browser's site settings."
+          : name === "NotFoundError"
+            ? "No camera was found on this device."
+            : name === "NotReadableError"
+              ? "The camera is already in use by another app."
+              : `Could not access the camera (${name}).`;
+      setStatus(reason);
       return [];
     }
   }, [enumerateCameras]);
@@ -745,6 +761,21 @@ export default function Home() {
     developerModeRef.current = next;
     greenBaselineRef.current = null;
     setDeveloperMode(next);
+  };
+
+  const applySimulatedBpm = () => {
+    const value = Number(simulatedBpmInput);
+    if (!Number.isFinite(value) || value < MIN_BPM || value > MAX_BPM) {
+      setStatus(`Enter a BPM between ${MIN_BPM} and ${MAX_BPM}`);
+      return;
+    }
+    stopCamera();
+    bpmRef.current = value;
+    setBpm(value);
+    setMonitoring(true);
+    setCalibrationSeconds(null);
+    setBeatSync((current) => ({ age: 0, revision: current.revision + 1 }));
+    setStatus("Simulated reading — not from camera");
   };
 
   const analyseFrame = useCallback(function frameAnalysis() {
@@ -986,9 +1017,19 @@ export default function Home() {
       await loadFaceDetector();
       setStatus("Finding your face…");
       animationRef.current = requestAnimationFrame(analyseFrame);
-    } catch {
+    } catch (error) {
+      console.error("Camera could not start", error);
       stopCamera();
-      setStatus("Face tracker could not start — check your connection and camera permission");
+      const name = error instanceof DOMException ? error.name : "UnknownError";
+      const reason =
+        name === "NotAllowedError"
+          ? "Camera access is blocked for this site. Check your browser's site settings."
+          : name === "NotFoundError"
+            ? "No camera was found on this device."
+            : name === "NotReadableError"
+              ? "The camera is already in use by another app."
+              : `Face tracker could not start (${name}).`;
+      setStatus(reason);
     }
   }, [analyseFrame, cameras, findCameras, loadFaceDetector, selectedCamera, stopCamera]);
 
@@ -1273,6 +1314,24 @@ export default function Home() {
           >
             {developerMode ? "Hide amplified green changes" : "Show amplified green changes"}
           </button>
+          {DEV_MODE && (
+            <div className="dev-mode-panel">
+              <span className="dev-mode-badge">Dev mode</span>
+              <label htmlFor="simulate-bpm">Simulate a BPM reading (no camera)</label>
+              <div className="camera-row">
+                <input
+                  id="simulate-bpm"
+                  type="number"
+                  min={MIN_BPM}
+                  max={MAX_BPM}
+                  placeholder={`${MIN_BPM}-${MAX_BPM}`}
+                  value={simulatedBpmInput}
+                  onChange={(event) => setSimulatedBpmInput(event.target.value)}
+                />
+                <button className="secondary compact" onClick={applySimulatedBpm}>Simulate</button>
+              </div>
+            </div>
+          )}
         </section>
       )}
 

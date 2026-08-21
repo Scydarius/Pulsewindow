@@ -7,8 +7,8 @@ export async function generateMetadata(): Promise<Metadata> {
   const host = requestHeaders.get("host") ?? "localhost:3000";
   const protocol = requestHeaders.get("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
   const origin = `${protocol}://${host}`;
-  const title = "Pulse Window — Camera Heart Rate Monitor";
-  const description = "A simple, contactless camera-based heart-rate wellness prototype.";
+  const title = "Pulse Window — Medication and Pulse Companion";
+  const description = "Keep medicines, dose times, symptoms, cuff readings, and camera pulse estimates together.";
 
   return {
     title,

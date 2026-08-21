@@ -18,7 +18,15 @@ type Reading = { id: string; bpm: number; timestamp: string; context?: string };
 type Medication = {
   id: string;
   name: string;
+  activeIngredient?: string;
+  brand?: string;
+  manufacturer?: string;
   dose: string;
+  prescribedDirections?: string;
+  purpose?: string;
+  prescriber?: string;
+  startDate?: string;
+  photoDataUrl?: string;
   time: string;
   checks: number;
   doseChange: boolean;
@@ -28,6 +36,20 @@ type Medication = {
   checkOffsetMinutes?: number[];
 };
 type DoseEvent = { id: string; medicationId: string; medicationName: string; timestamp: string };
+type BloodPressureReading = {
+  id: string;
+  systolic: number;
+  diastolic: number;
+  timestamp: string;
+  source: "Manual entry" | "Connected device";
+};
+type SymptomEntry = {
+  id: string;
+  symptom: string;
+  severity: "Mild" | "Moderate" | "Severe";
+  note?: string;
+  timestamp: string;
+};
 type MedicationPreset = {
   id: string;
   name: string;
@@ -46,6 +68,8 @@ type FaceBox = { x: number; y: number; width: number; height: number };
 const STORAGE_KEY = "pulse-window-readings";
 const MEDICATIONS_KEY = "pulse-window-medications";
 const DOSES_KEY = "pulse-window-dose-events";
+const BLOOD_PRESSURE_KEY = "pulse-window-blood-pressure";
+const SYMPTOMS_KEY = "pulse-window-symptoms";
 const PUBLIC_KEY_STORAGE_KEY = "pulse-window-public-key";
 const PRIVATE_KEY_STORAGE_KEY = "pulse-window-private-key";
 const MEDICATION_PRESETS: MedicationPreset[] = [
@@ -166,6 +190,11 @@ function formatDateTimeForFilename(date: Date): string {
     `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
     `_${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`
   );
+}
+
+function csvCell(value: string | number | undefined): string {
+  const text = value === undefined ? "" : String(value);
+  return `"${text.replaceAll('"', '""')}"`;
 }
 
 // Writes one entry into a real directory tree via the File System Access
@@ -685,13 +714,28 @@ export default function Home() {
   const [readings, setReadings] = useState<Reading[]>([]);
   const [medications, setMedications] = useState<Medication[]>([]);
   const [doses, setDoses] = useState<DoseEvent[]>([]);
+  const [bloodPressure, setBloodPressure] = useState<BloodPressureReading[]>([]);
+  const [symptoms, setSymptoms] = useState<SymptomEntry[]>([]);
   const [medicineName, setMedicineName] = useState("");
+  const [medicineActiveIngredient, setMedicineActiveIngredient] = useState("");
+  const [medicineBrand, setMedicineBrand] = useState("");
+  const [medicineManufacturer, setMedicineManufacturer] = useState("");
   const [medicineDose, setMedicineDose] = useState("");
+  const [medicineDirections, setMedicineDirections] = useState("");
+  const [medicinePurpose, setMedicinePurpose] = useState("");
+  const [medicinePrescriber, setMedicinePrescriber] = useState("");
+  const [medicineStartDate, setMedicineStartDate] = useState("");
+  const [medicinePhoto, setMedicinePhoto] = useState("");
   const [medicineTime, setMedicineTime] = useState("09:00");
   const [medicineChecks, setMedicineChecks] = useState(2);
   const [doseChange, setDoseChange] = useState(false);
   const [selectedPresetId, setSelectedPresetId] = useState("custom");
   const [patientNotice, setPatientNotice] = useState("");
+  const [bpSystolic, setBpSystolic] = useState("");
+  const [bpDiastolic, setBpDiastolic] = useState("");
+  const [symptomName, setSymptomName] = useState("");
+  const [symptomSeverity, setSymptomSeverity] = useState<SymptomEntry["severity"]>("Mild");
+  const [symptomNote, setSymptomNote] = useState("");
   const [publicKey, setPublicKey] = useState<string | null>(null);
   const [privateKey, setPrivateKey] = useState<string | null>(null);
   const [keysLoaded, setKeysLoaded] = useState(false);
@@ -748,6 +792,10 @@ export default function Home() {
       }
       const storedDoses = localStorage.getItem(DOSES_KEY);
       if (storedDoses) setDoses(JSON.parse(storedDoses));
+      const storedBloodPressure = localStorage.getItem(BLOOD_PRESSURE_KEY);
+      if (storedBloodPressure) setBloodPressure(JSON.parse(storedBloodPressure));
+      const storedSymptoms = localStorage.getItem(SYMPTOMS_KEY);
+      if (storedSymptoms) setSymptoms(JSON.parse(storedSymptoms));
 
       setPublicKey(localStorage.getItem(PUBLIC_KEY_STORAGE_KEY));
       setPrivateKey(localStorage.getItem(PRIVATE_KEY_STORAGE_KEY));
@@ -1177,6 +1225,7 @@ export default function Home() {
     const preset = MEDICATION_PRESETS.find((item) => item.id === id);
     if (!preset) return;
     setMedicineName(preset.name);
+    setMedicineActiveIngredient(preset.name);
     setMedicineChecks(preset.routineChecks);
     setDoseChange(false);
   };
@@ -1192,7 +1241,15 @@ export default function Home() {
     const medication: Medication = {
       id: crypto.randomUUID(),
       name: medicineName.trim(),
+      activeIngredient: medicineActiveIngredient.trim(),
+      brand: medicineBrand.trim(),
+      manufacturer: medicineManufacturer.trim(),
       dose: medicineDose.trim(),
+      prescribedDirections: medicineDirections.trim(),
+      purpose: medicinePurpose.trim(),
+      prescriber: medicinePrescriber.trim(),
+      startDate: medicineStartDate || undefined,
+      photoDataUrl: medicinePhoto || undefined,
       time: medicineTime,
       checks: medicineChecks,
       doseChange,
@@ -1208,10 +1265,59 @@ export default function Home() {
     const next = [...medications, medication];
     setMedications(next);
     localStorage.setItem(MEDICATIONS_KEY, JSON.stringify(next));
-    setMedicineName(""); setMedicineDose(""); setDoseChange(false);
+    setMedicineName(""); setMedicineActiveIngredient(""); setMedicineBrand("");
+    setMedicineManufacturer(""); setMedicineDose(""); setMedicineDirections("");
+    setMedicinePurpose(""); setMedicinePrescriber(""); setMedicineStartDate("");
+    setMedicinePhoto(""); setDoseChange(false); setSelectedPresetId("custom");
     if ("Notification" in window && Notification.permission === "default") {
       await Notification.requestPermission();
     }
+  };
+
+  const prepareMedicinePhoto = async (file?: File) => {
+    if (!file) return;
+    try {
+      const bitmap = await createImageBitmap(file);
+      const maximum = 720;
+      const scale = Math.min(1, maximum / Math.max(bitmap.width, bitmap.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+      canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+      canvas.getContext("2d")!.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+      setMedicinePhoto(canvas.toDataURL("image/jpeg", 0.72));
+      bitmap.close();
+    } catch {
+      setPatientNotice("That medicine photo could not be prepared. Try another image.");
+    }
+  };
+
+  const addBloodPressure = () => {
+    const systolic = Number(bpSystolic);
+    const diastolic = Number(bpDiastolic);
+    if (!Number.isFinite(systolic) || !Number.isFinite(diastolic) || systolic < 50 || systolic > 260 || diastolic < 30 || diastolic > 160) {
+      setPatientNotice("Enter a valid blood pressure reading from your cuff.");
+      return;
+    }
+    const next = [...bloodPressure, {
+      id: crypto.randomUUID(), systolic, diastolic,
+      timestamp: new Date().toISOString(), source: "Manual entry" as const,
+    }];
+    setBloodPressure(next);
+    localStorage.setItem(BLOOD_PRESSURE_KEY, JSON.stringify(next));
+    setBpSystolic(""); setBpDiastolic("");
+    setPatientNotice(`Saved blood pressure ${systolic}/${diastolic} mmHg.`);
+  };
+
+  const addSymptom = () => {
+    if (!symptomName.trim()) return;
+    const next = [...symptoms, {
+      id: crypto.randomUUID(), symptom: symptomName.trim(), severity: symptomSeverity,
+      note: symptomNote.trim() || undefined, timestamp: new Date().toISOString(),
+    }];
+    setSymptoms(next);
+    localStorage.setItem(SYMPTOMS_KEY, JSON.stringify(next));
+    setSymptomName(""); setSymptomNote(""); setSymptomSeverity("Mild");
+    setPatientNotice("Symptom added to your medication timeline.");
   };
 
   const removeMedication = (id: string) => {
@@ -1321,18 +1427,43 @@ export default function Home() {
       "PulseWindow monitoring summary",
       "Wellness estimates only - not a diagnosis or medical record",
       "",
+      "CURRENT MEDICATION PLAN",
+      "Medicine,Active ingredient,Brand,Manufacturer,Strength or dose,Pharmacy-label directions,Purpose,Prescriber,Formulation,Usual time,Start date",
+      ...medications.map((medication) => [
+        medication.name, medication.activeIngredient, medication.brand, medication.manufacturer,
+        medication.dose, medication.prescribedDirections, medication.purpose, medication.prescriber,
+        medication.formulation, medication.time, medication.startDate,
+      ].map(csvCell).join(",")),
+      "",
       "PULSE MEASUREMENTS",
-      "Date,Time,BPM,Context",
+      "Date,Time,BPM,Context,Source",
       ...readings.map((reading) => {
         const date = new Date(reading.timestamp);
-        return `${date.toLocaleDateString()},${date.toLocaleTimeString()},${reading.bpm},${reading.context || "Routine check"}`;
+        return [date.toLocaleDateString(), date.toLocaleTimeString(), reading.bpm,
+          reading.context || "Routine check", "PulseWindow camera estimate"].map(csvCell).join(",");
       }),
       "",
       "DOSES TAKEN",
       "Date,Time,Medication",
       ...doses.map((dose) => {
         const date = new Date(dose.timestamp);
-        return `${date.toLocaleDateString()},${date.toLocaleTimeString()},${dose.medicationName}`;
+        return [date.toLocaleDateString(), date.toLocaleTimeString(), dose.medicationName].map(csvCell).join(",");
+      }),
+      "",
+      "BLOOD PRESSURE",
+      "Date,Time,Systolic,Diastolic,Unit,Source",
+      ...bloodPressure.map((reading) => {
+        const date = new Date(reading.timestamp);
+        return [date.toLocaleDateString(), date.toLocaleTimeString(), reading.systolic,
+          reading.diastolic, "mmHg", reading.source].map(csvCell).join(",");
+      }),
+      "",
+      "SYMPTOMS",
+      "Date,Time,Symptom,Severity,Notes",
+      ...symptoms.map((entry) => {
+        const date = new Date(entry.timestamp);
+        return [date.toLocaleDateString(), date.toLocaleTimeString(), entry.symptom,
+          entry.severity, entry.note].map(csvCell).join(",");
       }),
     ];
     return rows.join("\n");
@@ -1414,6 +1545,66 @@ export default function Home() {
       doc.text("No measurements saved yet.", margin, y);
       y += 10;
     }
+
+    addPageIfNeeded(24);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.text("Current medication plan", margin, y);
+    y += 7;
+    if (!medications.length) {
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10);
+      doc.text("No medicines added yet.", margin, y);
+      y += 9;
+    }
+    medications.forEach((medication) => {
+      addPageIfNeeded(28);
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(11);
+      doc.text(`${medication.name}${medication.dose ? ` — ${medication.dose}` : ""}`, margin, y);
+      y += 5;
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(9);
+      const details = [
+        medication.activeIngredient && `Active ingredient: ${medication.activeIngredient}`,
+        (medication.brand || medication.manufacturer) && `Generic/brand: ${[medication.brand, medication.manufacturer].filter(Boolean).join(" · ")}`,
+        medication.prescribedDirections && `Pharmacy directions: ${medication.prescribedDirections}`,
+        medication.purpose && `Recorded reason: ${medication.purpose}`,
+        medication.prescriber && `Prescriber: ${medication.prescriber}`,
+        `Usual dose time: ${medication.time}`,
+      ].filter(Boolean) as string[];
+      details.forEach((detail) => {
+        const lines = doc.splitTextToSize(detail, contentWidth - 3);
+        addPageIfNeeded(lines.length * 4 + 2);
+        doc.text(lines, margin + 2, y);
+        y += lines.length * 4;
+      });
+      y += 3;
+    });
+
+    addPageIfNeeded(22);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(13);
+    doc.text("Other observations", margin, y);
+    y += 7;
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(9.5);
+    doc.text(`Blood-pressure readings: ${bloodPressure.length}`, margin, y); y += 5;
+    doc.text(`Symptoms recorded: ${symptoms.length}`, margin, y); y += 8;
+    [...bloodPressure].slice(-5).forEach((reading) => {
+      addPageIfNeeded(6);
+      doc.text(`${new Date(reading.timestamp).toLocaleString()} · ${reading.systolic}/${reading.diastolic} mmHg · ${reading.source}`, margin + 2, y);
+      y += 5;
+    });
+    [...symptoms].slice(-5).forEach((entry) => {
+      addPageIfNeeded(7);
+      const text = `${new Date(entry.timestamp).toLocaleString()} · ${entry.severity} ${entry.symptom}${entry.note ? ` · ${entry.note}` : ""}`;
+      const lines = doc.splitTextToSize(text, contentWidth - 3);
+      doc.text(lines, margin + 2, y);
+      y += lines.length * 4 + 1;
+    });
+
+    addPageIfNeeded(18);
 
     doc.setFont("helvetica", "bold");
     doc.setFontSize(13);
@@ -1770,14 +1961,26 @@ export default function Home() {
               {medications.length === 0 && <div className="empty-card"><span>💊</span><h3>No medicines yet</h3><p>Use “Add a medicine” below to create your monitoring plan.</p></div>}
               {medications.map((medication) => (
                 <article className="medicine-card" key={medication.id}>
-                  <div className="medicine-card-head"><div><h3>{medication.name}</h3><p>{medication.dose || "Dose not entered"}</p></div><strong>{medication.time}</strong></div>
-                  <p>⌁ {medication.checks} planned pulse check{medication.checks === 1 ? "" : "s"} daily</p>
-                  {medication.monitoringFrequency && <p className="monitoring-frequency">{medication.monitoringFrequency}</p>}
-                  <p className="reminder-times">◷ Reminder times: {reminderTimeSummary(medication)}</p>
-                  {medication.formulation && <p><b>Formulation:</b> {medication.formulation}</p>}
-                  {medication.checkTiming && <p className="check-timing"><b>Suggested pulse-check timing:</b> {medication.checkTiming}</p>}
-                  {medication.doseChange && <p className="dose-change">↻ Dose-change monitoring enabled</p>}
-                  <div className="card-actions"><button className="secondary" onClick={() => logDose(medication)}>✓ Log dose as taken</button><button className="delete-button" onClick={() => removeMedication(medication.id)}>Remove medicine</button></div>
+                  <div className="medicine-card-layout">
+                    {medication.photoDataUrl
+                      ? <img className="medicine-photo" src={medication.photoDataUrl} alt={`${medication.name} packaging or tablet`} />
+                      : <div className="medicine-photo-placeholder" aria-label="No medicine photo">💊</div>}
+                    <div className="medicine-card-body">
+                      <div className="medicine-card-head"><div><h3>{medication.name}</h3><p>{medication.dose || "Strength or dose not entered"}</p></div><strong>{medication.time}</strong></div>
+                      {medication.activeIngredient && medication.activeIngredient.toLowerCase() !== medication.name.toLowerCase() && <p><b>Active ingredient:</b> {medication.activeIngredient}</p>}
+                      {(medication.brand || medication.manufacturer) && <p><b>Generic/brand:</b> {[medication.brand, medication.manufacturer].filter(Boolean).join(" · ")}</p>}
+                      {medication.prescribedDirections && <p className="directions"><b>Pharmacy directions:</b> {medication.prescribedDirections}</p>}
+                      {medication.purpose && <p><b>Reason:</b> {medication.purpose}</p>}
+                      {medication.prescriber && <p><b>Prescriber:</b> {medication.prescriber}</p>}
+                      <p>⌁ {medication.checks} planned pulse check{medication.checks === 1 ? "" : "s"} daily</p>
+                      {medication.monitoringFrequency && <p className="monitoring-frequency">{medication.monitoringFrequency}</p>}
+                      <p className="reminder-times">◷ Reminder times: {reminderTimeSummary(medication)}</p>
+                      {medication.formulation && <p><b>Formulation:</b> {medication.formulation}</p>}
+                      {medication.checkTiming && <p className="check-timing"><b>Suggested pulse-check timing:</b> {medication.checkTiming}</p>}
+                      {medication.doseChange && <p className="dose-change">↻ Dose-change monitoring enabled</p>}
+                      <div className="card-actions"><button className="secondary" onClick={() => logDose(medication)}>✓ Log dose as taken</button><button className="delete-button" onClick={() => removeMedication(medication.id)}>Remove medicine</button></div>
+                    </div>
+                  </div>
                 </article>
               ))}
             </div>
@@ -1812,13 +2015,26 @@ export default function Home() {
                       <option value="custom">Custom</option>
                       {MEDICATION_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
                     </select></label>
-                    <label>Medicine name<input value={medicineName} onChange={(event) => setMedicineName(event.target.value)} placeholder="e.g. prescribed medicine" required /></label>
-                    <label>Dose (optional)<input value={medicineDose} onChange={(event) => setMedicineDose(event.target.value)} placeholder="e.g. 5 mg" /></label>
+                    <label>Name shown on the pharmacy label<input value={medicineName} onChange={(event) => setMedicineName(event.target.value)} placeholder="e.g. APO-Metoprolol" required /></label>
+                    <label>Active ingredient<input value={medicineActiveIngredient} onChange={(event) => setMedicineActiveIngredient(event.target.value)} placeholder="e.g. metoprolol" /></label>
+                    <label>Brand or generic prefix<input value={medicineBrand} onChange={(event) => setMedicineBrand(event.target.value)} placeholder="e.g. APO, Sandoz" /></label>
+                    <label>Manufacturer<input value={medicineManufacturer} onChange={(event) => setMedicineManufacturer(event.target.value)} placeholder="e.g. Apotex" /></label>
+                    <label>Strength or dose<input value={medicineDose} onChange={(event) => setMedicineDose(event.target.value)} placeholder="e.g. 25 mg" /></label>
+                    <label>Pharmacy-label directions<input value={medicineDirections} onChange={(event) => setMedicineDirections(event.target.value)} placeholder="e.g. Take one tablet each morning" /></label>
+                    <label>Reason for taking it<input value={medicinePurpose} onChange={(event) => setMedicinePurpose(event.target.value)} placeholder="e.g. heart rhythm" /></label>
+                    <label>Prescriber<input value={medicinePrescriber} onChange={(event) => setMedicinePrescriber(event.target.value)} placeholder="e.g. Dr Smith" /></label>
+                    <label>Start date<input type="date" value={medicineStartDate} onChange={(event) => setMedicineStartDate(event.target.value)} /></label>
                     <label>Usual dose time<input type="time" value={medicineTime} onChange={(event) => setMedicineTime(event.target.value)} /></label>
                     {selectedPresetId === "custom" ? <label>Pulse checks each day<select value={medicineChecks} onChange={(event) => setMedicineChecks(Number(event.target.value))}>
                       <option value="1">Once</option><option value="2">Twice</option><option value="3">3 times</option><option value="4">4 times</option>
                     </select></label> : <div className="form-plan-summary"><span>Planned checks</span><b>{medicineChecks} each day</b></div>}
                   </div>
+                  <label className="photo-field">
+                    <span>Photo of the packaging or tablet</span>
+                    <input type="file" accept="image/*" capture="environment" onChange={(event) => void prepareMedicinePhoto(event.target.files?.[0])} />
+                  </label>
+                  {medicinePhoto && <div className="photo-preview"><img src={medicinePhoto} alt="Preview of the medicine being added" /><button type="button" className="text-button" onClick={() => setMedicinePhoto("")}>Remove photo</button></div>}
+                  <p className="helper">Use the pharmacy label as the source of truth. A photo helps recognition but cannot confirm a medicine’s identity.</p>
                   <label className="toggle-row"><input type="checkbox" checked={doseChange} onChange={(event) => setDoseChangePlan(event.target.checked)} /> Extra monitoring during a dose change or loading period</label>
                   {selectedPresetId !== "custom" && (() => {
                     const preset = MEDICATION_PRESETS.find((item) => item.id === selectedPresetId);
@@ -1849,7 +2065,7 @@ export default function Home() {
           </header>
           <div className="history-content">
             <h2>Pulse and medication timeline</h2>
-            <p>Dose markers show when each pulse estimate was recorded. Data stays in this browser.</p>
+            <p>Review doses, camera pulse estimates, cuff readings and symptoms together. Data stays on this device.</p>
             {!!readings.length && (
               <div className="summary-strip">
                 <span><b>{readings.length}</b> measurements</span>
@@ -1862,6 +2078,36 @@ export default function Home() {
               <span>Pulse rate (BPM)</span>
             </div>
             <HistoryGraph readings={readings} doses={doses} />
+            <section className="observation-grid" aria-label="Add observations">
+              <article className="observation-card">
+                <h3>Add blood pressure</h3>
+                <p>Enter a reading from a validated upper-arm cuff.</p>
+                <div className="compact-fields">
+                  <label>Systolic<input inputMode="numeric" type="number" value={bpSystolic} onChange={(event) => setBpSystolic(event.target.value)} placeholder="120" /></label>
+                  <label>Diastolic<input inputMode="numeric" type="number" value={bpDiastolic} onChange={(event) => setBpDiastolic(event.target.value)} placeholder="80" /></label>
+                </div>
+                <button className="secondary" onClick={addBloodPressure}>Save cuff reading</button>
+              </article>
+              <article className="observation-card">
+                <h3>Add a symptom</h3>
+                <p>Record what you noticed; this does not diagnose the cause.</p>
+                <label>Symptom<input value={symptomName} onChange={(event) => setSymptomName(event.target.value)} placeholder="e.g. dizziness" /></label>
+                <label>How noticeable<select value={symptomSeverity} onChange={(event) => setSymptomSeverity(event.target.value as SymptomEntry["severity"])}><option>Mild</option><option>Moderate</option><option>Severe</option></select></label>
+                <label>Optional note<input value={symptomNote} onChange={(event) => setSymptomNote(event.target.value)} placeholder="What were you doing?" /></label>
+                <button className="secondary" onClick={addSymptom}>Add to timeline</button>
+              </article>
+            </section>
+            <section className="unified-timeline" aria-labelledby="timeline-heading">
+              <div className="graph-heading"><strong id="timeline-heading">Medication timeline</strong><span>Newest first</span></div>
+              {[...readings.map((item) => ({ id: item.id, timestamp: item.timestamp, icon: "♥", title: `${item.bpm.toFixed(0)} BPM`, detail: `${item.context || "Routine check"} · PulseWindow camera estimate` })),
+                ...doses.map((item) => ({ id: item.id, timestamp: item.timestamp, icon: "💊", title: `${item.medicationName} taken`, detail: "Dose logged by patient" })),
+                ...bloodPressure.map((item) => ({ id: item.id, timestamp: item.timestamp, icon: "⌁", title: `${item.systolic}/${item.diastolic} mmHg`, detail: item.source })),
+                ...symptoms.map((item) => ({ id: item.id, timestamp: item.timestamp, icon: "●", title: `${item.severity} ${item.symptom}`, detail: item.note || "Symptom recorded by patient" }))]
+                .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+                .slice(0, 30)
+                .map((item) => <article key={`${item.icon}-${item.id}`}><span className="timeline-icon" aria-hidden="true">{item.icon}</span><div><strong>{item.title}</strong><p>{item.detail}</p><time dateTime={item.timestamp}>{new Date(item.timestamp).toLocaleString()}</time></div></article>)}
+              {!readings.length && !doses.length && !bloodPressure.length && !symptoms.length && <div className="empty-card"><p>No timeline entries yet.</p></div>}
+            </section>
             <div className="export-actions">
               <button className="secondary" onClick={exportSignedReport}>Export report</button>
             </div>

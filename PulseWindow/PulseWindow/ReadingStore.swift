@@ -29,7 +29,15 @@ struct PulseReading: Identifiable, Codable, Hashable {
 struct Medication: Identifiable, Codable, Hashable {
     let id: UUID
     var name: String
+    var activeIngredient: String?
+    var brand: String?
+    var manufacturer: String?
     var dose: String
+    var prescribedDirections: String?
+    var purpose: String?
+    var prescriber: String?
+    var startDate: Date?
+    var photoData: Data?
     var usualTime: Date
     var checkPlan: Int
     var doseChangeMode: Bool
@@ -41,7 +49,15 @@ struct Medication: Identifiable, Codable, Hashable {
     init(
         id: UUID = UUID(),
         name: String,
+        activeIngredient: String? = nil,
+        brand: String? = nil,
+        manufacturer: String? = nil,
         dose: String,
+        prescribedDirections: String? = nil,
+        purpose: String? = nil,
+        prescriber: String? = nil,
+        startDate: Date? = nil,
+        photoData: Data? = nil,
         usualTime: Date,
         checkPlan: Int = 2,
         doseChangeMode: Bool = false,
@@ -52,7 +68,15 @@ struct Medication: Identifiable, Codable, Hashable {
     ) {
         self.id = id
         self.name = name
+        self.activeIngredient = activeIngredient
+        self.brand = brand
+        self.manufacturer = manufacturer
         self.dose = dose
+        self.prescribedDirections = prescribedDirections
+        self.purpose = purpose
+        self.prescriber = prescriber
+        self.startDate = startDate
+        self.photoData = photoData
         self.usualTime = usualTime
         self.checkPlan = checkPlan
         self.doseChangeMode = doseChangeMode
@@ -60,6 +84,39 @@ struct Medication: Identifiable, Codable, Hashable {
         self.formulation = formulation
         self.checkTiming = checkTiming
         self.checkOffsetMinutes = checkOffsetMinutes
+    }
+}
+
+struct BloodPressureReading: Identifiable, Codable, Hashable {
+    let id: UUID
+    let date: Date
+    let systolic: Int
+    let diastolic: Int
+    let source: String
+
+    init(id: UUID = UUID(), date: Date = Date(), systolic: Int, diastolic: Int,
+         source: String = "Manual entry") {
+        self.id = id
+        self.date = date
+        self.systolic = systolic
+        self.diastolic = diastolic
+        self.source = source
+    }
+}
+
+struct SymptomEntry: Identifiable, Codable, Hashable {
+    let id: UUID
+    let date: Date
+    let symptom: String
+    let severity: String
+    let note: String
+
+    init(id: UUID = UUID(), date: Date = Date(), symptom: String, severity: String, note: String) {
+        self.id = id
+        self.date = date
+        self.symptom = symptom
+        self.severity = severity
+        self.note = note
     }
 }
 
@@ -82,10 +139,14 @@ final class ReadingStore: ObservableObject {
     @Published private(set) var readings: [PulseReading] = []
     @Published private(set) var medications: [Medication] = []
     @Published private(set) var doses: [DoseEvent] = []
+    @Published private(set) var bloodPressure: [BloodPressureReading] = []
+    @Published private(set) var symptoms: [SymptomEntry] = []
 
     private let readingsKey = "pulse-window-native-readings"
     private let medicationsKey = "pulse-window-medications"
     private let dosesKey = "pulse-window-dose-events"
+    private let bloodPressureKey = "pulse-window-blood-pressure"
+    private let symptomsKey = "pulse-window-symptoms"
 
     init() {
         readings = load([PulseReading].self, key: readingsKey).sorted { $0.date < $1.date }
@@ -102,6 +163,8 @@ final class ReadingStore: ObservableObject {
             return upgraded
         }
         doses = load([DoseEvent].self, key: dosesKey).sorted { $0.date < $1.date }
+        bloodPressure = load([BloodPressureReading].self, key: bloodPressureKey).sorted { $0.date < $1.date }
+        symptoms = load([SymptomEntry].self, key: symptomsKey).sorted { $0.date < $1.date }
         persist(medications, key: medicationsKey)
         medications.forEach { scheduleReminders(for: $0) }
     }
@@ -144,7 +207,15 @@ final class ReadingStore: ObservableObject {
 
     func addMedication(
         name: String,
+        activeIngredient: String = "",
+        brand: String = "",
+        manufacturer: String = "",
         dose: String,
+        directions: String = "",
+        purpose: String = "",
+        prescriber: String = "",
+        startDate: Date? = nil,
+        photoData: Data? = nil,
         time: Date,
         checks: Int,
         doseChange: Bool,
@@ -155,7 +226,15 @@ final class ReadingStore: ObservableObject {
     ) {
         let medication = Medication(
             name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+            activeIngredient: activeIngredient.nilIfBlank,
+            brand: brand.nilIfBlank,
+            manufacturer: manufacturer.nilIfBlank,
             dose: dose.trimmingCharacters(in: .whitespacesAndNewlines),
+            prescribedDirections: directions.nilIfBlank,
+            purpose: purpose.nilIfBlank,
+            prescriber: prescriber.nilIfBlank,
+            startDate: startDate,
+            photoData: photoData,
             usualTime: time,
             checkPlan: checks,
             doseChangeMode: doseChange,
@@ -167,6 +246,22 @@ final class ReadingStore: ObservableObject {
         medications.append(medication)
         persist(medications, key: medicationsKey)
         scheduleReminders(for: medication)
+    }
+
+    func addBloodPressure(systolic: Int, diastolic: Int) {
+        bloodPressure.append(BloodPressureReading(systolic: systolic, diastolic: diastolic))
+        bloodPressure.sort { $0.date < $1.date }
+        persist(bloodPressure, key: bloodPressureKey)
+    }
+
+    func addSymptom(_ symptom: String, severity: String, note: String) {
+        symptoms.append(SymptomEntry(
+            symptom: symptom.trimmingCharacters(in: .whitespacesAndNewlines),
+            severity: severity,
+            note: note.trimmingCharacters(in: .whitespacesAndNewlines)
+        ))
+        symptoms.sort { $0.date < $1.date }
+        persist(symptoms, key: symptomsKey)
     }
 
     func deleteMedication(_ medication: Medication) {
@@ -195,15 +290,34 @@ final class ReadingStore: ObservableObject {
             "PulseWindow monitoring summary",
             "Wellness estimates only — not a medical record or diagnosis.",
             "",
+            "CURRENT MEDICATION PLAN",
+            "Medicine,Active ingredient,Brand,Manufacturer,Strength or dose,Pharmacy directions,Purpose,Prescriber,Usual time",
+        ]
+        rows += medications.map {
+            [$0.name, $0.activeIngredient ?? "", $0.brand ?? "", $0.manufacturer ?? "",
+             $0.dose, $0.prescribedDirections ?? "", $0.purpose ?? "", $0.prescriber ?? "",
+             $0.usualTime.formatted(date: .omitted, time: .shortened)]
+                .map(Self.csvCell).joined(separator: ",")
+        }
+        rows += [
+            "",
             "PULSE MEASUREMENTS",
-            "Date,Time,BPM,Context",
+            "Date,Time,BPM,Context,Source",
         ]
         let day = DateFormatter(); day.dateFormat = "yyyy-MM-dd"
         let time = DateFormatter(); time.dateFormat = "HH:mm"
-        rows += readings.map { "\(day.string(from: $0.date)),\(time.string(from: $0.date)),\($0.bpm),\($0.context)" }
+        rows += readings.map { [day.string(from: $0.date), time.string(from: $0.date), String($0.bpm), $0.context, "PulseWindow camera estimate"].map(Self.csvCell).joined(separator: ",") }
         rows += ["", "DOSES TAKEN", "Date,Time,Medication"]
-        rows += doses.map { "\(day.string(from: $0.date)),\(time.string(from: $0.date)),\($0.medicationName)" }
+        rows += doses.map { [day.string(from: $0.date), time.string(from: $0.date), $0.medicationName].map(Self.csvCell).joined(separator: ",") }
+        rows += ["", "BLOOD PRESSURE", "Date,Time,Systolic,Diastolic,Unit,Source"]
+        rows += bloodPressure.map { [day.string(from: $0.date), time.string(from: $0.date), String($0.systolic), String($0.diastolic), "mmHg", $0.source].map(Self.csvCell).joined(separator: ",") }
+        rows += ["", "SYMPTOMS", "Date,Time,Symptom,Severity,Notes"]
+        rows += symptoms.map { [day.string(from: $0.date), time.string(from: $0.date), $0.symptom, $0.severity, $0.note].map(Self.csvCell).joined(separator: ",") }
         return rows.joined(separator: "\n")
+    }
+
+    nonisolated private static func csvCell(_ value: String) -> String {
+        "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 
     private func readingContext(at date: Date) -> String {
@@ -295,5 +409,12 @@ private extension Double {
     func rounded(toPlaces places: Int) -> Double {
         let divisor = pow(10, Double(places))
         return (self * divisor).rounded() / divisor
+    }
+}
+
+private extension String {
+    var nilIfBlank: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

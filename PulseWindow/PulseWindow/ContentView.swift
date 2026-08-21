@@ -1,5 +1,7 @@
 import Charts
+import PhotosUI
 import SwiftUI
+import UIKit
 
 struct MedicationPreset: Identifiable, Hashable {
     let id: String
@@ -240,8 +242,27 @@ private struct MedicationsView: View {
                     ForEach(store.medications) { medication in
                         VStack(alignment: .leading, spacing: 12) {
                             HStack(alignment: .top) {
+                                Group {
+                                    if let data = medication.photoData, let image = UIImage(data: data) {
+                                        Image(uiImage: image).resizable().scaledToFill()
+                                    } else {
+                                        Image(systemName: "pill.fill").resizable().scaledToFit().padding(18)
+                                            .foregroundStyle(Color.pulseGreen)
+                                            .background(Color.pulseSoft)
+                                    }
+                                }
+                                .frame(width: 76, height: 76)
+                                .clipShape(RoundedRectangle(cornerRadius: 14))
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(medication.name).font(.title3.bold()).foregroundStyle(Color.pulseInk)
+                                    if let ingredient = medication.activeIngredient {
+                                        Text("Active ingredient: \(ingredient)")
+                                            .font(.subheadline.bold()).foregroundStyle(Color.pulseInk)
+                                    }
+                                    if medication.brand != nil || medication.manufacturer != nil {
+                                        Text([medication.brand, medication.manufacturer].compactMap { $0 }.joined(separator: " · "))
+                                            .font(.subheadline).foregroundStyle(Color.pulseMuted)
+                                    }
                                     Text(medication.dose.isEmpty ? "Dose not entered" : medication.dose)
                                         .foregroundStyle(Color.pulseMuted)
                                 }
@@ -265,6 +286,16 @@ private struct MedicationsView: View {
                             if let timing = medication.checkTiming {
                                 Text("Suggested pulse-check timing: \(timing)")
                                     .font(.body).foregroundStyle(Color.pulseInk)
+                            }
+                            if let directions = medication.prescribedDirections {
+                                Label(directions, systemImage: "doc.text.fill")
+                                    .foregroundStyle(Color.pulseInk)
+                            }
+                            if let purpose = medication.purpose {
+                                Text("Used for: \(purpose)").foregroundStyle(Color.pulseMuted)
+                            }
+                            if let prescriber = medication.prescriber {
+                                Text("Prescriber: \(prescriber)").foregroundStyle(Color.pulseMuted)
                             }
                             if medication.doseChangeMode {
                                 Label("Dose-change monitoring enabled", systemImage: "arrow.triangle.2.circlepath")
@@ -343,7 +374,17 @@ private struct AddMedicationView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var store: ReadingStore
     @State private var name = ""
+    @State private var activeIngredient = ""
+    @State private var brand = ""
+    @State private var manufacturer = ""
     @State private var dose = ""
+    @State private var directions = ""
+    @State private var purpose = ""
+    @State private var prescriber = ""
+    @State private var startDate = Date()
+    @State private var includeStartDate = false
+    @State private var selectedPhoto: PhotosPickerItem?
+    @State private var photoData: Data?
     @State private var time = Calendar.current.date(bySettingHour: 9, minute: 0, second: 0, of: Date()) ?? Date()
     @State private var checks = 2
     @State private var doseChange = false
@@ -362,9 +403,35 @@ private struct AddMedicationView: View {
                         ForEach(MedicationPreset.all) { preset in Text(preset.name).tag(preset.id) }
                     }
                     .onChange(of: selectedPresetID) { _, _ in applyPreset() }
-                    TextField("Name", text: $name)
-                    TextField("Dose (optional)", text: $dose)
+                    TextField("Name on the pack", text: $name)
+                    TextField("Active ingredient", text: $activeIngredient)
+                    TextField("Brand", text: $brand)
+                    TextField("Manufacturer (for example Sandoz)", text: $manufacturer)
+                    TextField("Strength or dose", text: $dose)
+                    TextField("Directions on pharmacy label", text: $directions, axis: .vertical)
+                    TextField("What it is for", text: $purpose)
+                    TextField("Prescriber", text: $prescriber)
+                    Toggle("Record start date", isOn: $includeStartDate)
+                    if includeStartDate { DatePicker("Started", selection: $startDate, displayedComponents: .date) }
                     DatePicker("Usual dose time", selection: $time, displayedComponents: .hourAndMinute)
+                }
+                Section("Photo of medicine") {
+                    if let photoData, let image = UIImage(data: photoData) {
+                        Image(uiImage: image).resizable().scaledToFit().frame(maxHeight: 220)
+                            .clipShape(RoundedRectangle(cornerRadius: 16))
+                    }
+                    PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                        Label(photoData == nil ? "Take or choose a photo" : "Replace photo", systemImage: "camera.fill")
+                    }
+                    .onChange(of: selectedPhoto) { _, item in
+                        Task {
+                            guard let data = try? await item?.loadTransferable(type: Data.self),
+                                  let image = UIImage(data: data) else { return }
+                            photoData = image.jpegData(compressionQuality: 0.70)
+                        }
+                    }
+                    Text("A clear pack or tablet photo helps distinguish brands and generic manufacturers. Confirm the medicine name from its pharmacy label.")
+                        .font(.footnote).foregroundStyle(Color.pulseMuted)
                 }
                 Section("Pulse check plan") {
                     if selectedPreset == nil {
@@ -397,7 +464,10 @@ private struct AddMedicationView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
                         store.addMedication(
-                            name: name, dose: dose, time: time,
+                            name: name, activeIngredient: activeIngredient, brand: brand,
+                            manufacturer: manufacturer, dose: dose, directions: directions,
+                            purpose: purpose, prescriber: prescriber,
+                            startDate: includeStartDate ? startDate : nil, photoData: photoData, time: time,
                             checks: checks, doseChange: doseChange,
                             monitoringFrequency: selectedPreset?.monitoringFrequency,
                             formulation: selectedPreset?.formulation,
@@ -511,6 +581,11 @@ private struct MonitorView: View {
 
 private struct HistoryView: View {
     @EnvironmentObject private var store: ReadingStore
+    @State private var systolic = ""
+    @State private var diastolic = ""
+    @State private var symptom = ""
+    @State private var severity = "Mild"
+    @State private var symptomNote = ""
 
     private var average: Double {
         store.readings.isEmpty ? 0 : store.readings.map(\.bpm).reduce(0, +) / Double(store.readings.count)
@@ -572,6 +647,67 @@ private struct HistoryView: View {
                     }
                 }
 
+                VStack(alignment: .leading, spacing: 12) {
+                    Label("Add blood pressure", systemImage: "gauge.with.dots.needle.50percent")
+                        .font(.title3.bold()).foregroundStyle(Color.pulseInk)
+                    Text("Enter a reading from a validated cuff. PulseWindow does not estimate blood pressure from the camera.")
+                        .foregroundStyle(Color.pulseMuted)
+                    HStack {
+                        TextField("Systolic", text: $systolic).keyboardType(.numberPad)
+                            .textFieldStyle(.roundedBorder)
+                        Text("/").font(.title2.bold()).foregroundStyle(Color.pulseMuted)
+                        TextField("Diastolic", text: $diastolic).keyboardType(.numberPad)
+                            .textFieldStyle(.roundedBorder)
+                        Text("mmHg").font(.caption.bold()).foregroundStyle(Color.pulseMuted)
+                    }
+                    Button {
+                        guard let top = Int(systolic), let bottom = Int(diastolic),
+                              (50...260).contains(top), (30...160).contains(bottom) else { return }
+                        store.addBloodPressure(systolic: top, diastolic: bottom)
+                        systolic = ""; diastolic = ""
+                    } label: { Label("Save cuff reading", systemImage: "plus.circle.fill").frame(maxWidth: .infinity) }
+                        .buttonStyle(SecondaryButtonStyle())
+                }
+                .cardStyle()
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Label("Record a symptom", systemImage: "cross.case.fill")
+                        .font(.title3.bold()).foregroundStyle(Color.pulseInk)
+                    TextField("Symptom (for example dizziness)", text: $symptom)
+                        .textFieldStyle(.roundedBorder)
+                    Picker("Severity", selection: $severity) {
+                        Text("Mild").tag("Mild"); Text("Moderate").tag("Moderate"); Text("Severe").tag("Severe")
+                    }.pickerStyle(.segmented)
+                    TextField("Optional note", text: $symptomNote, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+                    Button {
+                        guard !symptom.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                        store.addSymptom(symptom, severity: severity, note: symptomNote)
+                        symptom = ""; symptomNote = ""
+                    } label: { Label("Save symptom", systemImage: "plus.circle.fill").frame(maxWidth: .infinity) }
+                        .buttonStyle(SecondaryButtonStyle())
+                }
+                .cardStyle()
+
+                if !store.bloodPressure.isEmpty || !store.symptoms.isEmpty || !store.doses.isEmpty {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Other recent activity").font(.title3.bold()).foregroundStyle(Color.pulseInk)
+                        ForEach(store.bloodPressure.suffix(5).reversed()) { reading in
+                            HistoryRow(icon: "gauge.with.dots.needle.50percent",
+                                       title: "\(reading.systolic)/\(reading.diastolic) mmHg",
+                                       detail: "Blood pressure · \(reading.source)", date: reading.date)
+                        }
+                        ForEach(store.symptoms.suffix(5).reversed()) { entry in
+                            HistoryRow(icon: "cross.case.fill", title: "\(entry.symptom) · \(entry.severity)",
+                                       detail: entry.note.isEmpty ? "Symptom" : entry.note, date: entry.date)
+                        }
+                        ForEach(store.doses.suffix(5).reversed()) { dose in
+                            HistoryRow(icon: "pill.fill", title: dose.medicationName,
+                                       detail: "Dose logged", date: dose.date)
+                        }
+                    }.cardStyle()
+                }
+
                 ShareLink(item: store.exportText, subject: Text("PulseWindow monitoring summary")) {
                     Label("Export clinician summary", systemImage: "square.and.arrow.up").frame(maxWidth: .infinity)
                 }
@@ -584,6 +720,27 @@ private struct HistoryView: View {
         }
         .background(Color.pulseBackground.ignoresSafeArea())
         .navigationTitle("History").navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct HistoryRow: View {
+    let icon: String
+    let title: String
+    let detail: String
+    let date: Date
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: icon).foregroundStyle(Color.pulseGreen).frame(width: 24)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.body.bold()).foregroundStyle(Color.pulseInk)
+                Text(detail).font(.subheadline).foregroundStyle(Color.pulseMuted)
+                Text(date, format: .dateTime.day().month(.abbreviated).hour().minute())
+                    .font(.caption).foregroundStyle(Color.pulseMuted)
+            }
+            Spacer()
+        }
+        if date != Date.distantPast { Divider() }
     }
 }
 

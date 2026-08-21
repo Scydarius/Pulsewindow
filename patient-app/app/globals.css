@@ -257,13 +257,22 @@ button.compact { width: auto; min-height: 46px; margin: 0; padding: 0 14px; font
   color: var(--ink);
   background: white;
 }
+.photo-field { display: grid; gap: 7px; margin-top: 15px; color: var(--ink); font-size: 15px; font-weight: 800; }
+.photo-field input { min-height: 50px; padding: 10px; border: 1px dashed #a8bdb3; border-radius: 12px; background: #f7faf8; }
+.photo-preview { display: flex; align-items: center; gap: 14px; margin-top: 12px; }
+.photo-preview img { width: 92px; height: 92px; object-fit: cover; border: 1px solid var(--line); border-radius: 14px; }
 .toggle-row { display: flex; align-items: center; gap: 9px; margin-top: 15px; font-weight: 750; }
 .toggle-row input { width: 20px; height: 20px; accent-color: var(--green); }
 .medicine-list { display: grid; gap: 13px; }
 .medicine-card { padding: 19px; }
+.medicine-card-layout { display: grid; grid-template-columns: 110px 1fr; gap: 16px; align-items: start; }
+.medicine-card-body { min-width: 0; }
+.medicine-photo, .medicine-photo-placeholder { width: 110px; height: 110px; border: 1px solid var(--line); border-radius: 17px; object-fit: cover; background: #eef5f1; }
+.medicine-photo-placeholder { display: grid; place-items: center; color: var(--green); font-size: 37px; }
 .medicine-card-head { display: flex; justify-content: space-between; gap: 16px; }
 .medicine-card h3 { margin: 0; font-size: 21px; }
 .medicine-card p { margin: 5px 0; color: var(--muted); }
+.medicine-card .directions { color: var(--ink); }
 .medicine-card-head strong { color: var(--green); font-size: 19px; }
 .medicine-card .dose-change { color: #9a5413; font-weight: 800; }
 .medicine-card .monitoring-frequency, .monitoring-frequency { color: var(--green-dark); font-weight: 800; }
@@ -279,6 +288,21 @@ button.compact { width: auto; min-height: 46px; margin: 0; padding: 0 14px; font
 .export-actions { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
 .export-actions button { flex: 1 1 200px; }
 .saved-time small { color: #8a5a25; font-size: 12px; }
+.observation-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 18px; }
+.observation-card { padding: 19px; border: 1px solid var(--line); border-radius: 20px; background: white; }
+.observation-card h3 { margin: 0; font-size: 21px; }
+.observation-card > p { margin: 4px 0 13px; color: var(--muted); font-size: 15px; }
+.observation-card label { display: grid; gap: 5px; margin-top: 10px; font-size: 14px; font-weight: 800; }
+.observation-card input, .observation-card select { width: 100%; min-height: 47px; padding: 10px 12px; border: 1px solid #c7d4ce; border-radius: 11px; background: white; color: var(--ink); }
+.compact-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.unified-timeline { margin-top: 22px; }
+.unified-timeline > article { display: grid; grid-template-columns: 42px 1fr; gap: 11px; padding: 15px 17px; border: 1px solid var(--line); border-bottom: 0; background: white; }
+.unified-timeline > article:first-of-type { border-radius: 18px 18px 0 0; }
+.unified-timeline > article:last-of-type { border-bottom: 1px solid var(--line); border-radius: 0 0 18px 18px; }
+.timeline-icon { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 12px; color: var(--green); background: #eaf5ef; font-size: 20px; }
+.unified-timeline strong { color: var(--ink); }
+.unified-timeline p { margin: 2px 0; color: var(--muted); font-size: 14px; }
+.unified-timeline time { color: var(--muted); font-size: 12px; }
 
 .monitor-screen, .history-screen { min-height: 100svh; padding-bottom: 28px; }
 .topbar {
@@ -475,11 +499,13 @@ button.compact { width: auto; min-height: 46px; margin: 0; padding: 0 14px; font
   .summary-strip { gap: 12px 18px; font-size: 13px; }
   .history-graph, .empty-history { height: 280px; }
   .dashboard-screen { padding-top: max(22px, env(safe-area-inset-top)); }
-  .dashboard-grid, .form-grid, .preset-list { grid-template-columns: 1fr; }
+  .dashboard-grid, .form-grid, .preset-list, .observation-grid { grid-template-columns: 1fr; }
   .metric-card strong { font-size: 27px; }
   .medications-content { padding-top: 24px; }
   .add-medicine-content { padding: 0 12px 12px; }
   .medicine-form, .preset-panel { padding: 17px; }
+  .medicine-card-layout { grid-template-columns: 78px 1fr; gap: 12px; }
+  .medicine-photo, .medicine-photo-placeholder { width: 78px; height: 78px; border-radius: 13px; }
   .export-actions button { flex-basis: 100%; }
 }
 

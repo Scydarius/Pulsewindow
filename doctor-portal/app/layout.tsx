@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "PulseWindow — Doctor Portal",
-  description: "Verify patient-exported PulseWindow pulse summaries.",
+  description: "Verify patient-exported PulseWindow medication and monitoring summaries.",
 };
 
 export const viewport: Viewport = {

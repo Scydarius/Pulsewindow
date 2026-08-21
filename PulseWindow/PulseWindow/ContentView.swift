@@ -89,6 +89,7 @@ private struct DashboardView: View {
     @EnvironmentObject private var store: ReadingStore
 
     private var latest: PulseReading? { store.readings.last }
+    private var nextCheck: (medication: Medication, date: Date)? { store.nextPulseCheck() }
     @State private var doseMessage: String?
 
     var body: some View {
@@ -118,12 +119,60 @@ private struct DashboardView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("What would you like to do?")
+                    Text("Your next step")
                         .font(.title2.bold()).foregroundStyle(Color.pulseInk)
-                    Text("Choose one of the large actions below.")
+                    Text("PulseWindow puts the next planned action first.")
                         .font(.body).foregroundStyle(Color.pulseMuted)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+                if let nextCheck {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(spacing: 12) {
+                            Image(systemName: "heart.text.square.fill")
+                                .font(.system(size: 34)).foregroundStyle(Color.pulseRed)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(nextCheck.date <= Date().addingTimeInterval(15 * 60) ? "DUE NOW" : "NEXT MEASUREMENT")
+                                    .font(.caption.bold()).tracking(1.2).foregroundStyle(Color.pulseRed)
+                                Text("Pulse check for \(nextCheck.medication.name)")
+                                    .font(.title2.bold()).foregroundStyle(Color.pulseInk)
+                                Text(nextCheck.date, format: .dateTime.weekday(.wide).hour().minute())
+                                    .font(.headline).foregroundStyle(Color.pulseGreen)
+                            }
+                            Spacer()
+                        }
+                        Text("This time comes from the medication plan entered in PulseWindow. Follow your clinician or pharmacist’s instructions.")
+                            .font(.subheadline).foregroundStyle(Color.pulseMuted)
+                        NavigationLink { MonitorView() } label: {
+                            Label("Start measurement", systemImage: "waveform.path.ecg")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(PrimaryButtonStyle())
+                    }
+                    .padding(19)
+                    .background(Color.white, in: RoundedRectangle(cornerRadius: 22))
+                    .overlay(RoundedRectangle(cornerRadius: 22).stroke(Color.pulseRed.opacity(0.25), lineWidth: 2))
+                }
+
+                HStack(spacing: 12) {
+                    Image(systemName: store.notificationsEnabled ? "bell.badge.fill" : "bell.slash.fill")
+                        .font(.title2).foregroundStyle(Color.pulseGreen)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Measurement reminders").font(.headline).foregroundStyle(Color.pulseInk)
+                        Text(store.notificationStatus).font(.subheadline).foregroundStyle(Color.pulseMuted)
+                    }
+                    Spacer()
+                    if !store.notificationsEnabled {
+                        Button("Turn on") { store.enableNotifications() }
+                            .font(.subheadline.bold()).foregroundStyle(Color.white)
+                            .padding(.horizontal, 15).frame(minHeight: 44)
+                            .background(Color.pulseGreen, in: Capsule())
+                    } else {
+                        Label("On", systemImage: "checkmark.circle.fill")
+                            .font(.subheadline.bold()).foregroundStyle(Color.pulseGreen)
+                    }
+                }
+                .cardStyle()
 
                 VStack(alignment: .leading, spacing: 14) {
                     Label("Next medication", systemImage: "clock.fill")
@@ -386,7 +435,8 @@ private struct AddMedicationView: View {
     @State private var selectedPhoto: PhotosPickerItem?
     @State private var photoData: Data?
     @State private var time = Calendar.current.date(bySettingHour: 9, minute: 0, second: 0, of: Date()) ?? Date()
-    @State private var checks = 2
+    @State private var customCheckTime = Calendar.current.date(bySettingHour: 9, minute: 0, second: 0, of: Date()) ?? Date()
+    @State private var checks = 1
     @State private var doseChange = false
     @State private var selectedPresetID = "custom"
 
@@ -435,10 +485,8 @@ private struct AddMedicationView: View {
                 }
                 Section("Pulse check plan") {
                     if selectedPreset == nil {
-                        Picker("Checks per day", selection: $checks) {
-                            Text("Once").tag(1); Text("Twice").tag(2)
-                            Text("3 times").tag(3); Text("4 times").tag(4)
-                        }
+                        DatePicker("Daily measurement time confirmed by clinician",
+                                   selection: $customCheckTime, displayedComponents: .hourAndMinute)
                     } else {
                         LabeledContent("Planned checks", value: "\(checks) each day")
                     }
@@ -472,7 +520,8 @@ private struct AddMedicationView: View {
                             monitoringFrequency: selectedPreset?.monitoringFrequency,
                             formulation: selectedPreset?.formulation,
                             checkTiming: selectedPreset?.schedule,
-                            checkOffsets: plannedOffsets
+                            checkOffsets: selectedPreset == nil ? nil : plannedOffsets,
+                            checkTimes: selectedPreset == nil ? [customCheckTime] : nil
                         )
                         dismiss()
                     }
@@ -508,7 +557,10 @@ private struct AddMedicationView: View {
     }
 
     private var reminderPreview: String {
-        plannedOffsets.compactMap {
+        if selectedPreset == nil {
+            return customCheckTime.formatted(date: .omitted, time: .shortened)
+        }
+        return plannedOffsets.compactMap {
             Calendar.current.date(byAdding: .minute, value: $0, to: time)
         }
         .map { $0.formatted(date: .omitted, time: .shortened) }

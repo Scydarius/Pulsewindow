@@ -172,6 +172,44 @@ button.compact { width: auto; min-height: 46px; margin: 0; padding: 0 14px; font
   background: #eaf6ef;
   font-weight: 800;
 }
+.next-action-card {
+  display: grid;
+  grid-template-columns: auto 1fr minmax(180px, auto);
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 14px;
+  padding: 22px;
+  border: 2px solid #b9d9cb;
+  border-radius: 24px;
+  background: linear-gradient(135deg, #ffffff, #edf8f3);
+  box-shadow: 0 16px 42px rgba(23, 51, 42, .09);
+}
+.next-action-card.measurement-due { border-color: #f0b8ba; background: linear-gradient(135deg, #fff, #fff4f4); }
+.next-action-icon { display: grid; place-items: center; width: 60px; height: 60px; border-radius: 18px; color: white; background: var(--green); font-size: 29px; }
+.measurement-due .next-action-icon { background: var(--red); }
+.next-action-copy { min-width: 0; }
+.next-action-copy .eyebrow { margin-bottom: 4px; }
+.next-action-copy h2 { margin: 0; font-size: clamp(22px, 4vw, 29px); line-height: 1.15; }
+.next-action-copy p:last-child { margin: 7px 0 0; color: var(--muted); }
+.next-action-card button { margin: 0; }
+.notification-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 6px;
+  padding: 15px 17px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: white;
+}
+.notification-card > div { display: grid; grid-template-columns: auto 1fr; column-gap: 9px; align-items: center; }
+.notification-card strong { font-size: 16px; }
+.notification-card p { grid-column: 2; margin: 1px 0 0; color: var(--muted); font-size: 14px; }
+.notification-bell { color: var(--green); }
+.notification-ok { color: var(--green-dark); font-weight: 800; }
+.web-reminder-note { margin: 6px 4px 16px; color: var(--muted); font-size: 13px; }
+.next-check-line { margin: 0 0 9px; padding: 10px 12px; border-radius: 11px; color: var(--green-dark); background: #eaf6ef; font-size: 14px; }
 .metric-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 14px; }
 .metric-card, .dashboard-card, .medicine-form, .medicine-card, .empty-card, .preset-panel {
   border: 1px solid var(--line);
@@ -500,6 +538,10 @@ button.compact { width: auto; min-height: 46px; margin: 0; padding: 0 14px; font
   .history-graph, .empty-history { height: 280px; }
   .dashboard-screen { padding-top: max(22px, env(safe-area-inset-top)); }
   .dashboard-grid, .form-grid, .preset-list, .observation-grid { grid-template-columns: 1fr; }
+  .next-action-card { grid-template-columns: auto 1fr; padding: 18px; }
+  .next-action-card button { grid-column: 1 / -1; }
+  .notification-card { align-items: stretch; flex-direction: column; }
+  .notification-card button { width: 100%; }
   .metric-card strong { font-size: 27px; }
   .medications-content { padding-top: 24px; }
   .add-medicine-content { padding: 0 12px 12px; }

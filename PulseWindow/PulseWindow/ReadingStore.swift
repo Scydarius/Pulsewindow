@@ -45,6 +45,7 @@ struct Medication: Identifiable, Codable, Hashable {
     var formulation: String?
     var checkTiming: String?
     var checkOffsetMinutes: [Int]?
+    var checkTimes: [Date]?
 
     init(
         id: UUID = UUID(),
@@ -64,7 +65,8 @@ struct Medication: Identifiable, Codable, Hashable {
         monitoringFrequency: String? = nil,
         formulation: String? = nil,
         checkTiming: String? = nil,
-        checkOffsetMinutes: [Int]? = nil
+        checkOffsetMinutes: [Int]? = nil,
+        checkTimes: [Date]? = nil
     ) {
         self.id = id
         self.name = name
@@ -84,6 +86,7 @@ struct Medication: Identifiable, Codable, Hashable {
         self.formulation = formulation
         self.checkTiming = checkTiming
         self.checkOffsetMinutes = checkOffsetMinutes
+        self.checkTimes = checkTimes
     }
 }
 
@@ -141,6 +144,8 @@ final class ReadingStore: ObservableObject {
     @Published private(set) var doses: [DoseEvent] = []
     @Published private(set) var bloodPressure: [BloodPressureReading] = []
     @Published private(set) var symptoms: [SymptomEntry] = []
+    @Published private(set) var notificationStatus = "Checking…"
+    @Published private(set) var notificationsEnabled = false
 
     private let readingsKey = "pulse-window-native-readings"
     private let medicationsKey = "pulse-window-medications"
@@ -167,10 +172,70 @@ final class ReadingStore: ObservableObject {
         symptoms = load([SymptomEntry].self, key: symptomsKey).sorted { $0.date < $1.date }
         persist(medications, key: medicationsKey)
         medications.forEach { scheduleReminders(for: $0) }
+        refreshNotificationStatus()
     }
 
     var nextMedication: Medication? {
         medications.min { nextDoseDate(for: $0) < nextDoseDate(for: $1) }
+    }
+
+    func nextPulseCheck(from now: Date = Date()) -> (medication: Medication, date: Date)? {
+        let calendar = Calendar.current
+        var choices: [(Medication, Date)] = []
+        for medication in medications {
+            let doseComponents = calendar.dateComponents([.hour, .minute], from: medication.usualTime)
+            for dayOffset in 0...2 {
+                guard let day = calendar.date(byAdding: .day, value: dayOffset, to: now),
+                      let doseDate = calendar.date(bySettingHour: doseComponents.hour ?? 9,
+                                                   minute: doseComponents.minute ?? 0,
+                                                   second: 0, of: day) else { continue }
+                let checkDates: [Date]
+                if let times = medication.checkTimes, !times.isEmpty {
+                    checkDates = times.compactMap { time in
+                        let components = calendar.dateComponents([.hour, .minute], from: time)
+                        return calendar.date(bySettingHour: components.hour ?? 9,
+                                             minute: components.minute ?? 0,
+                                             second: 0, of: day)
+                    }
+                } else {
+                    let offsets = medication.checkOffsetMinutes ?? checkOffsets(for: medication.checkPlan)
+                    checkDates = offsets.compactMap { calendar.date(byAdding: .minute, value: $0, to: doseDate) }
+                }
+                for checkDate in checkDates where checkDate >= now.addingTimeInterval(-15 * 60) {
+                    choices.append((medication, checkDate))
+                }
+            }
+        }
+        return choices.min { $0.1 < $1.1 }.map { (medication: $0.0, date: $0.1) }
+    }
+
+    func refreshNotificationStatus() {
+        UNUserNotificationCenter.current().getNotificationSettings { settings in
+            let enabled = settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional
+            let text: String
+            switch settings.authorizationStatus {
+            case .authorized: text = "Reminders are on"
+            case .provisional: text = "Quiet reminders are on"
+            case .denied: text = "Reminders are blocked in Settings"
+            case .notDetermined: text = "Reminders are not set up"
+            case .ephemeral: text = "Reminders are temporarily on"
+            @unknown default: text = "Check notification settings"
+            }
+            Task { @MainActor in
+                self.notificationsEnabled = enabled
+                self.notificationStatus = text
+            }
+        }
+    }
+
+    func enableNotifications() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+            Task { @MainActor in
+                self.notificationsEnabled = granted
+                self.notificationStatus = granted ? "Reminders are on" : "Reminders are blocked in Settings"
+                if granted { self.medications.forEach { self.scheduleReminders(for: $0) } }
+            }
+        }
     }
 
     func nextDoseDate(for medication: Medication, from now: Date = Date()) -> Date {
@@ -183,6 +248,9 @@ final class ReadingStore: ObservableObject {
     }
 
     func checkTimeSummary(for medication: Medication) -> String {
+        if let times = medication.checkTimes, !times.isEmpty {
+            return times.map { $0.formatted(date: .omitted, time: .shortened) }.joined(separator: ", ")
+        }
         let offsets = medication.checkOffsetMinutes ?? checkOffsets(for: medication.checkPlan)
         return offsets.compactMap {
             Calendar.current.date(byAdding: .minute, value: $0, to: medication.usualTime)
@@ -222,7 +290,8 @@ final class ReadingStore: ObservableObject {
         monitoringFrequency: String? = nil,
         formulation: String? = nil,
         checkTiming: String? = nil,
-        checkOffsets: [Int]? = nil
+        checkOffsets: [Int]? = nil,
+        checkTimes: [Date]? = nil
     ) {
         let medication = Medication(
             name: name.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -241,7 +310,8 @@ final class ReadingStore: ObservableObject {
             monitoringFrequency: monitoringFrequency,
             formulation: formulation,
             checkTiming: checkTiming,
-            checkOffsetMinutes: checkOffsets
+            checkOffsetMinutes: checkOffsets,
+            checkTimes: checkTimes
         )
         medications.append(medication)
         persist(medications, key: medicationsKey)
@@ -348,14 +418,22 @@ final class ReadingStore: ObservableObject {
                 trigger: UNCalendarNotificationTrigger(dateMatching: doseComponents, repeats: true)
             ))
 
-            for (index, offset) in offsets.enumerated() {
-                guard let reminderTime = calendar.date(byAdding: .minute, value: offset,
-                                                       to: medication.usualTime) else { continue }
+            let reminderPlans: [(Date, String)]
+            if let times = medication.checkTimes, !times.isEmpty {
+                reminderPlans = times.map { ($0, "Time for the planned resting pulse check") }
+            } else {
+                reminderPlans = offsets.compactMap { offset in
+                    guard let time = calendar.date(byAdding: .minute, value: offset,
+                                                   to: medication.usualTime) else { return nil }
+                    return (time, Self.reminderTiming(for: offset))
+                }
+            }
+            for (index, plan) in reminderPlans.enumerated() {
                 let content = UNMutableNotificationContent()
                 content.title = "Pulse check"
-                content.body = "\(Self.reminderTiming(for: offset)) for \(medication.name). Use the plan confirmed by your clinician."
+                content.body = "\(plan.1) for \(medication.name). Use the plan confirmed by your clinician."
                 content.sound = .default
-                let components = calendar.dateComponents([.hour, .minute], from: reminderTime)
+                let components = calendar.dateComponents([.hour, .minute], from: plan.0)
                 center.add(UNNotificationRequest(
                     identifier: "check-\(medication.id)-\(index)",
                     content: content,

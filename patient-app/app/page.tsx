@@ -34,6 +34,7 @@ type Medication = {
   formulation?: string;
   checkTiming?: string;
   checkOffsetMinutes?: number[];
+  checkTimes?: string[];
 };
 type DoseEvent = { id: string; medicationId: string; medicationName: string; timestamp: string };
 type BloodPressureReading = {
@@ -49,6 +50,13 @@ type SymptomEntry = {
   severity: "Mild" | "Moderate" | "Severe";
   note?: string;
   timestamp: string;
+};
+type PlannedEvent = {
+  id: string;
+  kind: "dose" | "measurement";
+  date: Date;
+  medication: Medication;
+  label: string;
 };
 type MedicationPreset = {
   id: string;
@@ -277,6 +285,14 @@ function reminderTiming(offset: number) {
 }
 
 function reminderTimeSummary(medication: Medication) {
+  if (medication.checkTimes?.length) {
+    return medication.checkTimes.map((time) => {
+      const [hour, minute] = time.split(":").map(Number);
+      const date = new Date();
+      date.setHours(hour, minute, 0, 0);
+      return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    }).join(", ");
+  }
   return reminderTimesFor(medication.time, medicationCheckOffsets(medication));
 }
 
@@ -289,6 +305,56 @@ function reminderTimesFor(time: string, offsets: number[]) {
     date.setHours(Math.floor(target / 60), target % 60, 0, 0);
     return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   }).join(", ");
+}
+
+function upcomingPlanEvents(medications: Medication[], now: Date): PlannedEvent[] {
+  const events: PlannedEvent[] = [];
+  medications.forEach((medication) => {
+    const [hour, minute] = medication.time.split(":").map(Number);
+    for (let dayOffset = 0; dayOffset <= 2; dayOffset += 1) {
+      const doseDate = new Date(now);
+      doseDate.setDate(now.getDate() + dayOffset);
+      doseDate.setHours(hour, minute, 0, 0);
+      events.push({
+        id: `dose-${medication.id}-${doseDate.toISOString()}`,
+        kind: "dose",
+        date: doseDate,
+        medication,
+        label: `Medication time: ${medication.name}`,
+      });
+      const checks = medication.checkTimes?.length
+        ? medication.checkTimes.map((time, index) => {
+            const [checkHour, checkMinute] = time.split(":").map(Number);
+            const date = new Date(doseDate);
+            date.setHours(checkHour, checkMinute, 0, 0);
+            return { date, index };
+          })
+        : medicationCheckOffsets(medication).map((offset, index) => ({
+            date: new Date(doseDate.getTime() + offset * 60_000), index,
+          }));
+      checks.forEach(({ date: checkDate, index }) => {
+        events.push({
+          id: `check-${medication.id}-${index}-${checkDate.toISOString()}`,
+          kind: "measurement",
+          date: checkDate,
+          medication,
+          label: `Pulse measurement for ${medication.name}`,
+        });
+      });
+    }
+  });
+  return events
+    .filter((event) => event.date.getTime() >= now.getTime() - 15 * 60_000)
+    .sort((a, b) => a.date.getTime() - b.date.getTime());
+}
+
+function relativePlanTime(date: Date, now: Date) {
+  const minutes = Math.round((date.getTime() - now.getTime()) / 60_000);
+  if (minutes <= 0 && minutes >= -15) return "Due now";
+  if (minutes < 60) return `In ${minutes} minute${minutes === 1 ? "" : "s"}`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `In ${hours} hour${hours === 1 ? "" : "s"}`;
+  return date.toLocaleDateString([], { weekday: "long" });
 }
 
 function interpolateSamples(samples: Sample[], fps = 30) {
@@ -727,7 +793,8 @@ export default function Home() {
   const [medicineStartDate, setMedicineStartDate] = useState("");
   const [medicinePhoto, setMedicinePhoto] = useState("");
   const [medicineTime, setMedicineTime] = useState("09:00");
-  const [medicineChecks, setMedicineChecks] = useState(2);
+  const [medicineChecks, setMedicineChecks] = useState(1);
+  const [medicineCheckTime, setMedicineCheckTime] = useState("09:00");
   const [doseChange, setDoseChange] = useState(false);
   const [selectedPresetId, setSelectedPresetId] = useState("custom");
   const [patientNotice, setPatientNotice] = useState("");
@@ -743,6 +810,9 @@ export default function Home() {
   const [keySetupPrivateInput, setKeySetupPrivateInput] = useState("");
   const [keySetupError, setKeySetupError] = useState("");
   const [keySetupSaving, setKeySetupSaving] = useState(false);
+  const [showKeySetup, setShowKeySetup] = useState(false);
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">("unsupported");
+  const [clock, setClock] = useState(() => new Date());
   const videoRef = useRef<HTMLVideoElement>(null);
   const workCanvasRef = useRef<HTMLCanvasElement>(null);
   const diagnosticCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -800,10 +870,29 @@ export default function Home() {
       setPublicKey(localStorage.getItem(PUBLIC_KEY_STORAGE_KEY));
       setPrivateKey(localStorage.getItem(PRIVATE_KEY_STORAGE_KEY));
       setKeysLoaded(true);
+      setNotificationPermission("Notification" in window ? Notification.permission : "unsupported");
     }, 0);
     if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js");
     return () => window.clearTimeout(timer);
   }, []);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(new Date()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const enableNotifications = async () => {
+    if (!("Notification" in window)) {
+      setNotificationPermission("unsupported");
+      setPatientNotice("This browser does not support reminders. Use the iPhone app for notifications that work while closed.");
+      return;
+    }
+    const permission = await Notification.requestPermission();
+    setNotificationPermission(permission);
+    setPatientNotice(permission === "granted"
+      ? "Reminders are enabled while this web app is open. The iPhone app can remind you even when it is closed."
+      : "Notifications are off. You can enable them later in your browser or iPhone settings.");
+  };
 
   const saveKeys = async () => {
     const nextPublicKey = keySetupPublicInput.trim();
@@ -829,6 +918,8 @@ export default function Home() {
       setPrivateKey(nextPrivateKey);
       setKeySetupPublicInput("");
       setKeySetupPrivateInput("");
+      setShowKeySetup(false);
+      setPatientNotice("Clinician-report verification is ready on this device.");
     } finally {
       setKeySetupSaving(false);
     }
@@ -842,20 +933,35 @@ export default function Home() {
       medications.forEach((medication) => {
         const [hour, minute] = medication.time.split(":").map(Number);
         const doseMinutes = hour * 60 + minute;
+        const measurementReminders = medication.checkTimes?.length
+          ? medication.checkTimes.map((time) => {
+              const [checkHour, checkMinute] = time.split(":").map(Number);
+              return {
+                target: checkHour * 60 + checkMinute,
+                title: "Pulse check",
+                body: `Time for the planned resting pulse check for ${medication.name}. Use the plan confirmed by your clinician.`,
+              };
+            })
+          : medicationCheckOffsets(medication).map((offset) => ({
+              target: (doseMinutes + offset + 1440) % 1440,
+              title: "Pulse check",
+              body: `${reminderTiming(offset)} for ${medication.name}. Use the plan confirmed by your clinician.`,
+            }));
         const reminders = [
-          { offset: 0, title: "Medication check-in", body: `If you took ${medication.name}, log the dose in PulseWindow.` },
-          ...medicationCheckOffsets(medication).map((offset) => ({
-            offset,
-            title: "Pulse check",
-            body: `${reminderTiming(offset)} for ${medication.name}. Use the plan confirmed by your clinician.`,
-          })),
+          { target: doseMinutes, title: "Medication check-in", body: `If you took ${medication.name}, log the dose in PulseWindow.` },
+          ...measurementReminders,
         ];
         reminders.forEach((reminder, index) => {
-          const target = (doseMinutes + reminder.offset + 1440) % 1440;
-          if (target !== currentMinutes) return;
+          if (reminder.target !== currentMinutes) return;
           const key = `pulse-window-notified-${medication.id}-${index}-${now.toDateString()}`;
           if (sessionStorage.getItem(key)) return;
-          new Notification(reminder.title, { body: reminder.body });
+          navigator.serviceWorker?.ready
+            .then((registration) => registration.showNotification(reminder.title, {
+              body: reminder.body,
+              icon: "/icon-192.png",
+              tag: key,
+            }))
+            .catch(() => new Notification(reminder.title, { body: reminder.body }));
           sessionStorage.setItem(key, "1");
         });
       });
@@ -1220,6 +1326,10 @@ export default function Home() {
     setTimeout(startCamera, 0);
   };
 
+  const plannedEvents = upcomingPlanEvents(medications, clock);
+  const nextEvent = plannedEvents[0];
+  const nextMeasurement = plannedEvents.find((event) => event.kind === "measurement");
+
   const applyMedicationPreset = (id: string) => {
     setSelectedPresetId(id);
     const preset = MEDICATION_PRESETS.find((item) => item.id === id);
@@ -1261,6 +1371,7 @@ export default function Home() {
         if (!preset) return undefined;
         return doseChange ? preset.changeOffsets : preset.routineOffsets;
       })(),
+      checkTimes: selectedPresetId === "custom" ? [medicineCheckTime] : undefined,
     };
     const next = [...medications, medication];
     setMedications(next);
@@ -1269,6 +1380,7 @@ export default function Home() {
     setMedicineManufacturer(""); setMedicineDose(""); setMedicineDirections("");
     setMedicinePurpose(""); setMedicinePrescriber(""); setMedicineStartDate("");
     setMedicinePhoto(""); setDoseChange(false); setSelectedPresetId("custom");
+    setMedicineCheckTime("09:00"); setMedicineChecks(1);
     if ("Notification" in window && Notification.permission === "default") {
       await Notification.requestPermission();
     }
@@ -1679,7 +1791,7 @@ export default function Home() {
 
   const exportSignedReport = async () => {
     if (!publicKey || !privateKey) {
-      setPatientNotice("Set up your verification keys before exporting a report.");
+      setShowKeySetup(true);
       return;
     }
 
@@ -1723,18 +1835,16 @@ export default function Home() {
     }
   };
 
-  const needsKeySetup = keysLoaded && (!publicKey || !privateKey);
-
   return (
     <main className="app-shell">
-      {needsKeySetup && (
+      {showKeySetup && keysLoaded && (
         <div className="key-setup-overlay" role="dialog" aria-modal="true" aria-label="Set up verification keys">
           <div className="key-setup-card">
             <p className="eyebrow">Pulse Window</p>
             <h1>Set up verification keys</h1>
             <p className="intro">
               Your clinic issued a public and private key for this device. Enter both to continue — they let a
-              doctor confirm that an exported summary came from you unaltered.
+              doctor confirm that an exported summary came from you unaltered. This is optional for daily use.
             </p>
             <div className="field">
               <label htmlFor="key-setup-public">Public key</label>
@@ -1758,6 +1868,7 @@ export default function Home() {
             <button className="primary" onClick={saveKeys} disabled={keySetupSaving}>
               {keySetupSaving ? "Checking…" : "Save and continue"}
             </button>
+            <button className="secondary" onClick={() => setShowKeySetup(false)}>Not now</button>
           </div>
         </div>
       )}
@@ -1774,11 +1885,32 @@ export default function Home() {
           </div>
 
           <div className="task-heading">
-            <h2>What would you like to do?</h2>
-            <p>Choose one of the large actions below.</p>
+            <h2>Your next step</h2>
+            <p>PulseWindow puts the next planned action first.</p>
           </div>
 
           {patientNotice && <div className="patient-notice" role="status">✓ {patientNotice}</div>}
+
+          {nextEvent && (
+            <article className={`next-action-card ${nextEvent.kind === "measurement" ? "measurement-due" : ""}`}>
+              <div className="next-action-icon" aria-hidden="true">{nextEvent.kind === "measurement" ? "♥" : "💊"}</div>
+              <div className="next-action-copy">
+                <p className="eyebrow">{relativePlanTime(nextEvent.date, clock)}</p>
+                <h2>{nextEvent.label}</h2>
+                <p>{nextEvent.date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} · Based on the plan entered for {nextEvent.medication.name}</p>
+              </div>
+              {nextEvent.kind === "measurement"
+                ? <button className="primary" onClick={openMonitor}>Start measurement</button>
+                : <button className="primary" onClick={() => logDose(nextEvent.medication)}>Mark as taken</button>}
+            </article>
+          )}
+
+          <article className="notification-card">
+            <div><span className="notification-bell" aria-hidden="true">●</span><strong>Measurement reminders</strong><p>{notificationPermission === "granted" ? "On for this browser" : notificationPermission === "denied" ? "Blocked in browser settings" : "Not set up yet"}</p></div>
+            {notificationPermission !== "granted" && <button className="secondary compact" onClick={enableNotifications}>Turn on reminders</button>}
+            {notificationPermission === "granted" && <span className="notification-ok">✓ On</span>}
+          </article>
+          <p className="web-reminder-note">Web reminders work while this page is open. The iPhone app uses system notifications and can remind you when closed.</p>
 
           <div className="dashboard-grid">
             <article className="dashboard-card next-dose-card">
@@ -1800,6 +1932,7 @@ export default function Home() {
 
             <article className="dashboard-card camera-card">
               <div className="section-title"><span>●</span><strong>Camera pulse check</strong></div>
+              {nextMeasurement && <p className="next-check-line"><b>Next planned check:</b> {nextMeasurement.date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} for {nextMeasurement.medication.name}</p>}
               <p className="helper">Sit still in steady front lighting. Calibration takes 15 seconds, then the app confirms a stable estimate.</p>
               <label htmlFor="camera">Camera source</label>
               <div className="camera-row">
@@ -2025,9 +2158,9 @@ export default function Home() {
                     <label>Prescriber<input value={medicinePrescriber} onChange={(event) => setMedicinePrescriber(event.target.value)} placeholder="e.g. Dr Smith" /></label>
                     <label>Start date<input type="date" value={medicineStartDate} onChange={(event) => setMedicineStartDate(event.target.value)} /></label>
                     <label>Usual dose time<input type="time" value={medicineTime} onChange={(event) => setMedicineTime(event.target.value)} /></label>
-                    {selectedPresetId === "custom" ? <label>Pulse checks each day<select value={medicineChecks} onChange={(event) => setMedicineChecks(Number(event.target.value))}>
-                      <option value="1">Once</option><option value="2">Twice</option><option value="3">3 times</option><option value="4">4 times</option>
-                    </select></label> : <div className="form-plan-summary"><span>Planned checks</span><b>{medicineChecks} each day</b></div>}
+                    {selectedPresetId === "custom"
+                      ? <label>Daily measurement time confirmed by clinician<input type="time" value={medicineCheckTime} onChange={(event) => { setMedicineCheckTime(event.target.value); setMedicineChecks(1); }} /></label>
+                      : <div className="form-plan-summary"><span>Planned checks</span><b>{medicineChecks} each day</b></div>}
                   </div>
                   <label className="photo-field">
                     <span>Photo of the packaging or tablet</span>

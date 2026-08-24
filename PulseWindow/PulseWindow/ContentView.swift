@@ -107,15 +107,11 @@ private struct DashboardView: View {
                         Text("Today")
                             .font(.system(size: 34, weight: .bold, design: .rounded))
                             .foregroundStyle(Color.pulseInk)
+                        Text(Date(), format: .dateTime.weekday(.wide).day().month(.wide))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Color.pulseMuted)
                     }
                     Spacer()
-                }
-
-                HStack(spacing: 12) {
-                    MetricCard(value: latest.map { "\(Int($0.bpm.rounded()))" } ?? "—",
-                               label: "Latest BPM", icon: "heart.fill", colour: .pulseRed)
-                    MetricCard(value: "\(store.medications.count)", label: "Medicines",
-                               icon: "pill.fill", colour: .pulseGreen)
                 }
 
                 VStack(alignment: .leading, spacing: 5) {
@@ -150,8 +146,13 @@ private struct DashboardView: View {
                         .buttonStyle(PrimaryButtonStyle())
                     }
                     .padding(19)
-                    .background(Color.white, in: RoundedRectangle(cornerRadius: 22))
-                    .overlay(RoundedRectangle(cornerRadius: 22).stroke(Color.pulseRed.opacity(0.25), lineWidth: 2))
+                    .background(
+                        LinearGradient(colors: [Color.white, Color.pulseRed.opacity(0.055)],
+                                       startPoint: .topLeading, endPoint: .bottomTrailing),
+                        in: RoundedRectangle(cornerRadius: 24)
+                    )
+                    .overlay(RoundedRectangle(cornerRadius: 24).stroke(Color.pulseRed.opacity(0.20), lineWidth: 1.5))
+                    .shadow(color: Color.pulseRed.opacity(0.07), radius: 18, y: 9)
                 }
 
                 HStack(spacing: 12) {
@@ -173,6 +174,13 @@ private struct DashboardView: View {
                     }
                 }
                 .cardStyle()
+
+                HStack(spacing: 12) {
+                    MetricCard(value: latest.map { "\(Int($0.bpm.rounded()))" } ?? "—",
+                               label: "Latest BPM", icon: "heart.fill", colour: .pulseRed)
+                    MetricCard(value: "\(store.medications.count)", label: "Medicines in plan",
+                               icon: "pill.fill", colour: .pulseGreen)
+                }
 
                 VStack(alignment: .leading, spacing: 14) {
                     Label("Next medication", systemImage: "clock.fill")

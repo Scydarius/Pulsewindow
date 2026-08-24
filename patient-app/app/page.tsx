@@ -1876,13 +1876,12 @@ export default function Home() {
         <section className="dashboard-screen">
           <header className="dashboard-header">
             <div className="brand-mark" aria-hidden="true">♥</div>
-            <div><p className="eyebrow">Pulse Window</p><h1>Today</h1></div>
+            <div>
+              <p className="eyebrow">Pulse Window</p>
+              <h1>Today</h1>
+              <p className="today-date">{clock.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" })}</p>
+            </div>
           </header>
-
-          <div className="metric-grid">
-            <article className="metric-card"><span>♥</span><strong>{readings.length ? Math.round(readings.at(-1)!.bpm) : "—"}</strong><small>Latest BPM</small></article>
-            <article className="metric-card"><span>💊</span><strong>{medications.length}</strong><small>Medicines</small></article>
-          </div>
 
           <div className="task-heading">
             <h2>Your next step</h2>
@@ -1911,6 +1910,11 @@ export default function Home() {
             {notificationPermission === "granted" && <span className="notification-ok">✓ On</span>}
           </article>
           <p className="web-reminder-note">Web reminders work while this page is open. The iPhone app uses system notifications and can remind you when closed.</p>
+
+          <div className="metric-grid" aria-label="Today at a glance">
+            <article className="metric-card"><span>♥</span><div><strong>{readings.length ? Math.round(readings.at(-1)!.bpm) : "—"}</strong><small>Latest BPM</small></div></article>
+            <article className="metric-card"><span>💊</span><div><strong>{medications.length}</strong><small>Medicines in your plan</small></div></article>
+          </div>
 
           <div className="dashboard-grid">
             <article className="dashboard-card next-dose-card">

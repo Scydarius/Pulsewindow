@@ -14,7 +14,11 @@
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
     "@mediapipe/tasks-vision": "^1.0.1",
+    "@mui/icons-material": "^9.3.1",
+    "@mui/material": "^9.3.1",
     "drizzle-orm": "0.45.2",
     "jspdf": "^4.2.1",
     "jszip": "^3.10.1",

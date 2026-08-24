@@ -1,6 +1,8 @@
 # PulseWindow
 
-PulseWindow is a wellness prototype that estimates pulse rate from small colour changes in facial skin captured by a camera. It includes a patient-facing web app, a doctor portal, and a native iPhone app, along with medication reminders and a pulse-and-medication history timeline.
+PulseWindow is a wellness prototype that estimates pulse rate and respiration rate from small colour changes in facial skin captured by a camera (rPPG). It includes a patient-facing web app, a doctor portal, and a native iPhone app, along with medication reminders and a pulse-and-medication history timeline.
+
+Blood oxygen (SpO2) and blood pressure are deliberately not estimated from the camera — both require signal sources a standard RGB webcam doesn't have (SpO2 needs a calibrated infrared channel; BP needs pulse transit time between two synchronized measurement sites), so any camera-derived number for either would be fabricated rather than measured.
 
 > PulseWindow is not a medical device and must not be used for diagnosis, emergencies, or medication changes. Follow instructions from a qualified clinician or pharmacist.
 

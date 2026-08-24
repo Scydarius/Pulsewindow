@@ -27,3 +27,12 @@ test("camera rPPG measurement remains available", async () => {
   assert.match(page, /estimateBPM/);
   assert.match(page, /FaceDetector/);
 });
+
+test("measurement plans, experimental breathing rate, and caregiver view are present", async () => {
+  const page = await readFile(new URL("page.tsx", appRoot), "utf8");
+  assert.match(page, /Import a measurement plan from your doctor/);
+  assert.match(page, /estimateRespiratoryRate/);
+  assert.match(page, /breaths\/min · experimental/);
+  assert.match(page, /Open caregiver view/);
+  assert.doesNotMatch(page, /Medication check-in/);
+});

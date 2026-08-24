@@ -12,9 +12,10 @@ import {
   signReportBytes,
 } from "./crypto";
 
-type Screen = "start" | "monitor" | "medications" | "history";
+type Screen = "start" | "monitor" | "medications" | "history" | "caregiver";
 type Camera = { deviceId: string; label: string };
-type Reading = { id: string; bpm: number; timestamp: string; context?: string };
+type MeasurementMetric = "heartRate" | "respiratoryRate";
+type Reading = { id: string; bpm: number; respiratoryRate?: number; timestamp: string; context?: string };
 type Medication = {
   id: string;
   name: string;
@@ -35,6 +36,7 @@ type Medication = {
   checkTiming?: string;
   checkOffsetMinutes?: number[];
   checkTimes?: string[];
+  measurementMetrics?: MeasurementMetric[];
 };
 type DoseEvent = { id: string; medicationId: string; medicationName: string; timestamp: string };
 type BloodPressureReading = {
@@ -53,10 +55,30 @@ type SymptomEntry = {
 };
 type PlannedEvent = {
   id: string;
-  kind: "dose" | "measurement";
+  kind: "measurement";
   date: Date;
   medication: Medication;
   label: string;
+};
+type DoctorMeasurementPlan = {
+  version: 1;
+  planId: string;
+  patientLabel?: string;
+  medicationName: string;
+  metrics: MeasurementMetric[];
+  times: string[];
+  clinician?: string;
+  note?: string;
+  createdAt: string;
+};
+type CaregiverSnapshot = {
+  version: 1;
+  generatedAt: string;
+  medications: Array<Pick<Medication, "name" | "dose" | "prescribedDirections" | "measurementMetrics">>;
+  readings: Reading[];
+  doses: DoseEvent[];
+  bloodPressure: BloodPressureReading[];
+  symptoms: SymptomEntry[];
 };
 type MedicationPreset = {
   id: string;
@@ -78,6 +100,7 @@ const MEDICATIONS_KEY = "pulse-window-medications";
 const DOSES_KEY = "pulse-window-dose-events";
 const BLOOD_PRESSURE_KEY = "pulse-window-blood-pressure";
 const SYMPTOMS_KEY = "pulse-window-symptoms";
+const RESPIRATION_WINDOW_SECONDS = 40;
 const PUBLIC_KEY_STORAGE_KEY = "pulse-window-public-key";
 const PRIVATE_KEY_STORAGE_KEY = "pulse-window-private-key";
 const MEDICATION_PRESETS: MedicationPreset[] = [
@@ -239,14 +262,35 @@ function presetForMedicineName(medicineName: string) {
 
 function upgradeMedicationPlan(medication: Medication): Medication {
   const preset = presetForMedicineName(medication.name);
-  if (!preset) return medication;
+  if (!preset) return { ...medication, measurementMetrics: medication.measurementMetrics ?? ["heartRate"] };
   return {
     ...medication,
     monitoringFrequency: preset.monitoringFrequency,
     formulation: preset.formulation,
     checkTiming: preset.schedule,
     checkOffsetMinutes: medication.doseChange ? preset.changeOffsets : preset.routineOffsets,
+    measurementMetrics: medication.measurementMetrics ?? ["heartRate"],
   };
+}
+
+function encodePortable(value: unknown) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function decodePortable<T>(code: string): T {
+  const base64 = code.trim().replaceAll("-", "+").replaceAll("_", "/");
+  const binary = atob(base64 + "=".repeat((4 - base64.length % 4) % 4));
+  return JSON.parse(new TextDecoder().decode(Uint8Array.from(binary, (character) => character.charCodeAt(0)))) as T;
+}
+
+function measurementName(metrics: MeasurementMetric[] | undefined) {
+  const selected = metrics?.length ? metrics : ["heartRate"];
+  if (selected.includes("heartRate") && selected.includes("respiratoryRate")) return "Heart and breathing-rate measurement";
+  if (selected.includes("respiratoryRate")) return "Breathing-rate measurement";
+  return "Heart-rate measurement";
 }
 
 function median(values: number[]) {
@@ -315,13 +359,6 @@ function upcomingPlanEvents(medications: Medication[], now: Date): PlannedEvent[
       const doseDate = new Date(now);
       doseDate.setDate(now.getDate() + dayOffset);
       doseDate.setHours(hour, minute, 0, 0);
-      events.push({
-        id: `dose-${medication.id}-${doseDate.toISOString()}`,
-        kind: "dose",
-        date: doseDate,
-        medication,
-        label: `Medication time: ${medication.name}`,
-      });
       const checks = medication.checkTimes?.length
         ? medication.checkTimes.map((time, index) => {
             const [checkHour, checkMinute] = time.split(":").map(Number);
@@ -338,7 +375,7 @@ function upcomingPlanEvents(medications: Medication[], now: Date): PlannedEvent[
           kind: "measurement",
           date: checkDate,
           medication,
-          label: `Pulse measurement for ${medication.name}`,
+          label: `${measurementName(medication.measurementMetrics)} for ${medication.name}`,
         });
       });
     }
@@ -475,6 +512,37 @@ function estimateBPM(samples: Sample[]) {
   const lastPeakIndex = (completedCycles * 2 * Math.PI - phase) / angularFrequency;
   const beatAge = Math.max(0, (lastIndex - lastPeakIndex) / fps);
   return { bpm: peak.bpm, quality: total > 0 ? local / total : 0, beatAge };
+}
+
+// Separate experimental path: slow colour modulation can contain a breathing
+// component, but it is much more sensitive to movement than the pulse estimate.
+function estimateRespiratoryRate(samples: Sample[]) {
+  if (samples.length < 250 || samples.at(-1)!.time - samples[0].time < 30) return null;
+  const fps = 10;
+  const colours = interpolateSamples(samples, fps);
+  if (colours.length < 300) return null;
+  const raw = colours.map((colour) => 0.5 * colour[1] + 0.25 * colour[0] + 0.25 * colour[2]);
+  const first = raw[0];
+  const slope = (raw.at(-1)! - first) / Math.max(1, raw.length - 1);
+  const signal = raw.map((value, index) => value - first - slope * index);
+  const powers: { rate: number; power: number }[] = [];
+  for (let rate = 6; rate <= 30; rate += 0.25) {
+    const frequency = rate / 60;
+    let real = 0;
+    let imaginary = 0;
+    signal.forEach((value, index) => {
+      const hann = 0.5 - 0.5 * Math.cos((2 * Math.PI * index) / Math.max(1, signal.length - 1));
+      const angle = 2 * Math.PI * frequency * index / fps;
+      real += value * hann * Math.cos(angle);
+      imaginary -= value * hann * Math.sin(angle);
+    });
+    powers.push({ rate, power: real * real + imaginary * imaginary });
+  }
+  const peak = powers.reduce((best, item) => item.power > best.power ? item : best);
+  const total = powers.reduce((sum, item) => sum + item.power, 0);
+  const local = powers.filter((item) => Math.abs(item.rate - peak.rate) <= 2).reduce((sum, item) => sum + item.power, 0);
+  const quality = total > 0 ? local / total : 0;
+  return quality >= 0.28 ? { rate: peak.rate, quality } : null;
 }
 
 type PulseEstimate = NonNullable<ReturnType<typeof estimateBPM>>;
@@ -770,6 +838,7 @@ export default function Home() {
   const [selectedCamera, setSelectedCamera] = useState("");
   const [monitoring, setMonitoring] = useState(false);
   const [bpm, setBpm] = useState<number | null>(null);
+  const [respiratoryRate, setRespiratoryRate] = useState<number | null>(null);
   const [status, setStatus] = useState("Ready to measure");
   const [calibrationSeconds, setCalibrationSeconds] = useState<number | null>(null);
   const [beatSync, setBeatSync] = useState({ age: 0, revision: 0 });
@@ -798,6 +867,8 @@ export default function Home() {
   const [doseChange, setDoseChange] = useState(false);
   const [selectedPresetId, setSelectedPresetId] = useState("custom");
   const [patientNotice, setPatientNotice] = useState("");
+  const [planCode, setPlanCode] = useState("");
+  const [caregiverSnapshot, setCaregiverSnapshot] = useState<CaregiverSnapshot | null>(null);
   const [bpSystolic, setBpSystolic] = useState("");
   const [bpDiastolic, setBpDiastolic] = useState("");
   const [symptomName, setSymptomName] = useState("");
@@ -819,6 +890,8 @@ export default function Home() {
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
   const regionSamplesRef = useRef<Sample[][]>([[], [], []]);
+  const respirationSamplesRef = useRef<Sample[]>([]);
+  const respirationCandidatesRef = useRef<number[]>([]);
   const candidatesRef = useRef<number[]>([]);
   const pendingJumpRef = useRef<number[]>([]);
   const lastEstimateRef = useRef(0);
@@ -947,10 +1020,11 @@ export default function Home() {
               title: "Pulse check",
               body: `${reminderTiming(offset)} for ${medication.name}. Use the plan confirmed by your clinician.`,
             }));
-        const reminders = [
-          { target: doseMinutes, title: "Medication check-in", body: `If you took ${medication.name}, log the dose in PulseWindow.` },
-          ...measurementReminders,
-        ];
+        const reminders = measurementReminders.map((reminder) => ({
+          ...reminder,
+          title: measurementName(medication.measurementMetrics),
+          body: `${reminder.body.replace("pulse check", "measurement")} ${measurementName(medication.measurementMetrics)} only — this is not a reminder to take medicine.`,
+        }));
         reminders.forEach((reminder, index) => {
           if (reminder.target !== currentMinutes) return;
           const key = `pulse-window-notified-${medication.id}-${index}-${now.toDateString()}`;
@@ -1032,6 +1106,8 @@ export default function Home() {
     faceBoxRef.current = null;
     greenBaselineRef.current = null;
     regionSamplesRef.current = [[], [], []];
+    respirationSamplesRef.current = [];
+    respirationCandidatesRef.current = [];
     candidatesRef.current = [];
     pendingJumpRef.current = [];
     unstableUntilRef.current = 0;
@@ -1040,6 +1116,7 @@ export default function Home() {
     sampleOffsetsRef.current = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
     setFaceBox(null);
     setCalibrationSeconds(null);
+    setRespiratoryRate(null);
     setMonitoring(false);
     setStatus("Monitoring stopped");
   }, []);
@@ -1177,6 +1254,7 @@ export default function Home() {
         regionSamplesRef.current = regionSamplesRef.current.map((samples) =>
           samples.map((sample) => ({ ...sample, time: sample.time + pauseSeconds }))
         );
+        respirationSamplesRef.current = respirationSamplesRef.current.map((sample) => ({ ...sample, time: sample.time + pauseSeconds }));
         sampleOffsetsRef.current = regionColours.map((rgb, index) => {
           const previous = regionSamplesRef.current[index].at(-1)?.rgb;
           return previous
@@ -1194,6 +1272,11 @@ export default function Home() {
         ...samples,
         { time: now, rgb: correctedColours[index] },
       ].filter((sample) => now - sample.time <= SIGNAL_WINDOW_SECONDS + 0.5));
+      respirationSamplesRef.current.push({
+        time: now,
+        rgb: [0, 1, 2].map((channel) => median(correctedColours.map((colour) => colour[channel]))) as RGB,
+      });
+      respirationSamplesRef.current = respirationSamplesRef.current.filter((sample) => now - sample.time <= RESPIRATION_WINDOW_SECONDS + 0.5);
       const duration = now - regionSamplesRef.current[0][0].time;
       if (duration < INITIAL_CALIBRATION_SECONDS - 0.5) {
         const remaining = Math.max(1, Math.ceil(INITIAL_CALIBRATION_SECONDS - duration));
@@ -1203,6 +1286,15 @@ export default function Home() {
       else if (now - lastEstimateRef.current >= 1) {
         setCalibrationSeconds(null);
         lastEstimateRef.current = now;
+        const breathingEstimate = estimateRespiratoryRate(respirationSamplesRef.current);
+        if (breathingEstimate) {
+          respirationCandidatesRef.current.push(breathingEstimate.rate);
+          respirationCandidatesRef.current = respirationCandidatesRef.current.slice(-5);
+          const breathingRecent = respirationCandidatesRef.current.slice(-3);
+          if (breathingRecent.length === 3 && Math.max(...breathingRecent) - Math.min(...breathingRecent) <= 3) {
+            setRespiratoryRate(median(breathingRecent));
+          }
+        }
         const regionEstimates = regionSamplesRef.current
           .map(estimateBPM)
           .filter((estimate): estimate is PulseEstimate =>
@@ -1283,10 +1375,13 @@ export default function Home() {
     try {
       stopCamera();
       regionSamplesRef.current = [[], [], []];
+      respirationSamplesRef.current = [];
+      respirationCandidatesRef.current = [];
       candidatesRef.current = [];
       pendingJumpRef.current = [];
       bpmRef.current = null;
       setBpm(null);
+      setRespiratoryRate(null);
       const available = cameras.length ? cameras : await findCameras();
       const deviceId = selectedCamera || available[0]?.deviceId;
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -1372,6 +1467,7 @@ export default function Home() {
         return doseChange ? preset.changeOffsets : preset.routineOffsets;
       })(),
       checkTimes: selectedPresetId === "custom" ? [medicineCheckTime] : undefined,
+      measurementMetrics: ["heartRate"],
     };
     const next = [...medications, medication];
     setMedications(next);
@@ -1464,13 +1560,14 @@ export default function Home() {
     return `${Math.abs(hours).toFixed(1)} h ${hours >= 0 ? "after" : "before"} ${nearest.medicationName}`;
   };
 
-  const saveReadingAt = (bpmValue: number, date: Date) => {
+  const saveReadingAt = (bpmValue: number, date: Date, breathingValue: number | null = respiratoryRate) => {
     const context = readingContext(date);
     const next = [
       ...readings,
       {
         id: crypto.randomUUID(),
         bpm: Math.round(bpmValue * 10) / 10,
+        respiratoryRate: breathingValue === null ? undefined : Math.round(breathingValue * 10) / 10,
         timestamp: date.toISOString(),
         context,
       },
@@ -1478,6 +1575,44 @@ export default function Home() {
     setReadings(next);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
     return context;
+  };
+
+  const importDoctorPlan = () => {
+    try {
+      const plan = decodePortable<DoctorMeasurementPlan>(planCode);
+      if (plan.version !== 1 || !plan.medicationName?.trim() || !plan.times?.length ||
+          !plan.times.every((time) => /^([01]\d|2[0-3]):[0-5]\d$/.test(time)) ||
+          !plan.metrics?.length || plan.metrics.some((metric) => metric !== "heartRate" && metric !== "respiratoryRate")) {
+        throw new Error("Invalid measurement plan");
+      }
+      const match = medications.find((item) => item.name.toLowerCase() === plan.medicationName.toLowerCase());
+      const nextMedication: Medication = match ? {
+        ...match, checkTimes: plan.times, checks: plan.times.length, measurementMetrics: plan.metrics,
+        checkTiming: plan.note || `Measurement plan from ${plan.clinician || "the care team"}.`,
+      } : {
+        id: crypto.randomUUID(), name: plan.medicationName, dose: "", time: plan.times[0],
+        checks: plan.times.length, doseChange: false, checkTimes: plan.times,
+        measurementMetrics: plan.metrics,
+        checkTiming: plan.note || `Measurement plan from ${plan.clinician || "the care team"}.`,
+      };
+      const next = match ? medications.map((item) => item.id === match.id ? nextMedication : item) : [...medications, nextMedication];
+      setMedications(next);
+      localStorage.setItem(MEDICATIONS_KEY, JSON.stringify(next));
+      setPlanCode("");
+      setPatientNotice(`Imported ${measurementName(plan.metrics).toLowerCase()} reminders for ${plan.medicationName}. This did not create medication-taking reminders.`);
+    } catch {
+      setPatientNotice("That measurement-plan code could not be read. Ask the doctor to copy the full code again.");
+    }
+  };
+
+  const openCaregiverView = () => {
+    setCaregiverSnapshot({
+      version: 1, generatedAt: new Date().toISOString(),
+      medications: medications.map(({ name, dose, prescribedDirections, measurementMetrics }) => ({ name, dose, prescribedDirections, measurementMetrics })),
+      readings: [...readings].slice(-30), doses: [...doses].slice(-30),
+      bloodPressure: [...bloodPressure].slice(-20), symptoms: [...symptoms].slice(-20),
+    });
+    setScreen("caregiver");
   };
 
   const saveReading = () => {
@@ -1547,11 +1682,11 @@ export default function Home() {
         medication.formulation, medication.time, medication.startDate,
       ].map(csvCell).join(",")),
       "",
-      "PULSE MEASUREMENTS",
-      "Date,Time,BPM,Context,Source",
+      "CAMERA MEASUREMENTS",
+      "Date,Time,BPM,Respiratory rate (breaths/min experimental),Context,Source",
       ...readings.map((reading) => {
         const date = new Date(reading.timestamp);
-        return [date.toLocaleDateString(), date.toLocaleTimeString(), reading.bpm,
+        return [date.toLocaleDateString(), date.toLocaleTimeString(), reading.bpm, reading.respiratoryRate ?? "",
           reading.context || "Routine check", "PulseWindow camera estimate"].map(csvCell).join(",");
       }),
       "",
@@ -1879,7 +2014,7 @@ export default function Home() {
             <div>
               <p className="eyebrow">Pulse Window</p>
               <h1>Today</h1>
-              <p className="today-date">{clock.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" })}</p>
+              <p className="today-date" suppressHydrationWarning>{clock.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" })}</p>
             </div>
           </header>
 
@@ -1891,16 +2026,14 @@ export default function Home() {
           {patientNotice && <div className="patient-notice" role="status">✓ {patientNotice}</div>}
 
           {nextEvent && (
-            <article className={`next-action-card ${nextEvent.kind === "measurement" ? "measurement-due" : ""}`}>
-              <div className="next-action-icon" aria-hidden="true">{nextEvent.kind === "measurement" ? "♥" : "💊"}</div>
+            <article className="next-action-card measurement-due">
+              <div className="next-action-icon" aria-hidden="true">♥</div>
               <div className="next-action-copy">
                 <p className="eyebrow">{relativePlanTime(nextEvent.date, clock)}</p>
                 <h2>{nextEvent.label}</h2>
                 <p>{nextEvent.date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} · Based on the plan entered for {nextEvent.medication.name}</p>
               </div>
-              {nextEvent.kind === "measurement"
-                ? <button className="primary" onClick={openMonitor}>Start measurement</button>
-                : <button className="primary" onClick={() => logDose(nextEvent.medication)}>Mark as taken</button>}
+              <button className="primary" onClick={openMonitor}>Start measurement</button>
             </article>
           )}
 
@@ -1918,7 +2051,7 @@ export default function Home() {
 
           <div className="dashboard-grid">
             <article className="dashboard-card next-dose-card">
-              <div className="section-title"><span>◷</span><strong>Next medication</strong></div>
+              <div className="section-title"><span>◷</span><strong>Medication context</strong></div>
               {medications.length ? (() => {
                 const medication = [...medications].sort((a, b) => a.time.localeCompare(b.time))[0];
                 return <>
@@ -2011,6 +2144,10 @@ export default function Home() {
               <strong>{bpm === null ? "--" : Math.round(bpm)}</strong>
               <span>BPM</span>
             </div>
+            <div className="bpm-block breathing-block">
+              <strong>{respiratoryRate === null ? "--" : Math.round(respiratoryRate)}</strong>
+              <span>breaths/min · experimental</span>
+            </div>
             {calibrationSeconds !== null && (
               <div className="calibration-card" aria-live="polite">
                 <div>
@@ -2027,6 +2164,7 @@ export default function Home() {
               </div>
             )}
             <p className="status" aria-live="polite">{status}</p>
+            <p className="helper">The breathing estimate needs about 30–40 seconds of still video. It is experimental and must not be used to detect respiratory depression or emergencies.</p>
           </div>
 
           <div className="monitor-actions">
@@ -2093,6 +2231,16 @@ export default function Home() {
 
             {patientNotice && <div className="patient-notice" role="status">✓ {patientNotice}</div>}
 
+            <details className="add-medicine-panel doctor-plan-panel">
+              <summary>＋ Import a measurement plan from your doctor</summary>
+              <div className="add-medicine-content">
+                <h3>Doctor measurement-plan code</h3>
+                <p className="helper">This only schedules heart-rate or breathing-rate checks. It will never tell you when to take medication.</p>
+                <textarea rows={5} value={planCode} onChange={(event) => setPlanCode(event.target.value)} placeholder="Paste the code supplied by the doctor portal" />
+                <button className="primary" type="button" onClick={importDoctorPlan} disabled={!planCode.trim()}>Import measurement reminders</button>
+              </div>
+            </details>
+
             <h3 className="subsection-heading">Your medicines</h3>
             <div className="medicine-list">
               {medications.length === 0 && <div className="empty-card"><span>💊</span><h3>No medicines yet</h3><p>Use “Add a medicine” below to create your monitoring plan.</p></div>}
@@ -2109,7 +2257,7 @@ export default function Home() {
                       {medication.prescribedDirections && <p className="directions"><b>Pharmacy directions:</b> {medication.prescribedDirections}</p>}
                       {medication.purpose && <p><b>Reason:</b> {medication.purpose}</p>}
                       {medication.prescriber && <p><b>Prescriber:</b> {medication.prescriber}</p>}
-                      <p>⌁ {medication.checks} planned pulse check{medication.checks === 1 ? "" : "s"} daily</p>
+                      <p>⌁ {medication.checks} planned {measurementName(medication.measurementMetrics).toLowerCase()}{medication.checks === 1 ? "" : "s"} daily</p>
                       {medication.monitoringFrequency && <p className="monitoring-frequency">{medication.monitoringFrequency}</p>}
                       <p className="reminder-times">◷ Reminder times: {reminderTimeSummary(medication)}</p>
                       {medication.formulation && <p><b>Formulation:</b> {medication.formulation}</p>}
@@ -2247,6 +2395,7 @@ export default function Home() {
             </section>
             <div className="export-actions">
               <button className="secondary" onClick={exportSignedReport}>Export report</button>
+              <button className="secondary" onClick={openCaregiverView}>Open caregiver view</button>
             </div>
             <div className="graph-heading">
               <strong>Every measurement</strong>
@@ -2282,6 +2431,19 @@ export default function Home() {
             <button onClick={() => navigate("medications")}>● <span>Medicines</span></button>
             <button className="active" aria-current="page">⌁ <span>History</span></button>
           </nav>
+        </section>
+      )}
+
+      {screen === "caregiver" && caregiverSnapshot && (
+        <section className="history-screen caregiver-screen">
+          <header className="topbar"><button className="text-button" onClick={() => setScreen("history")}>← Exit caregiver view</button><span>Caregiver view</span><span /></header>
+          <div className="history-content">
+            <div className="page-heading"><p className="eyebrow">Read only</p><h2>Care summary</h2><p>Snapshot created {new Date(caregiverSnapshot.generatedAt).toLocaleString()}. Nothing can be edited from this screen.</p></div>
+            <div className="summary-strip"><span><b>{caregiverSnapshot.readings.length}</b> measurements</span><span><b>{caregiverSnapshot.medications.length}</b> medicines</span><span><b>{caregiverSnapshot.symptoms.length}</b> symptoms</span></div>
+            <div className="medicine-list">{caregiverSnapshot.medications.map((medication, index) => <article className="medicine-card" key={`${medication.name}-${index}`}><h3>{medication.name}</h3><p>{medication.dose || "Dose not recorded"}</p>{medication.prescribedDirections && <p>{medication.prescribedDirections}</p>}<p>{measurementName(medication.measurementMetrics)}</p></article>)}</div>
+            <section className="unified-timeline"><div className="graph-heading"><strong>Recent measurements</strong><span>Newest first</span></div>{[...caregiverSnapshot.readings].reverse().map((reading) => <article key={reading.id}><span className="timeline-icon">♥</span><div><strong>{reading.bpm.toFixed(0)} BPM{reading.respiratoryRate ? ` · ${reading.respiratoryRate.toFixed(0)} breaths/min (experimental)` : ""}</strong><p>{reading.context || "Routine check"}</p><time>{new Date(reading.timestamp).toLocaleString()}</time></div></article>)}</section>
+            <p className="disclaimer">Caregiver view is informational only. Breathing rate is experimental. Follow the care plan and seek urgent help for concerning symptoms.</p>
+          </div>
         </section>
       )}
     </main>

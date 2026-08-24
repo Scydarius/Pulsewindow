@@ -19,6 +19,14 @@ type VerifyResult = {
   message: string;
   record?: PatientRecord;
 };
+type MeasurementMetric = "heartRate" | "respiratoryRate";
+
+function encodePortable(value: unknown) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
 
 function generatePatientId(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(5));
@@ -40,6 +48,12 @@ export default function Home() {
   const [dob, setDob] = useState("");
   const [issuing, setIssuing] = useState(false);
   const [issuedKeys, setIssuedKeys] = useState<IssuedKeys | null>(null);
+  const [planMedication, setPlanMedication] = useState("");
+  const [planTimes, setPlanTimes] = useState("09:00");
+  const [planHeartRate, setPlanHeartRate] = useState(true);
+  const [planRespiratoryRate, setPlanRespiratoryRate] = useState(false);
+  const [planNote, setPlanNote] = useState("");
+  const [measurementPlanCode, setMeasurementPlanCode] = useState("");
 
   const [verifyStatus, setVerifyStatus] = useState<"idle" | "checking">("idle");
   const [verifyResult, setVerifyResult] = useState<VerifyResult | null>(null);
@@ -65,6 +79,19 @@ export default function Home() {
   const saveRegistry = (next: PatientRecord[]) => {
     setRegistry(next);
     localStorage.setItem(REGISTRY_STORAGE_KEY, recordsToCsv(next));
+  };
+
+  const createMeasurementPlan = () => {
+    const times = planTimes.split(",").map((time) => time.trim()).filter(Boolean);
+    const metrics: MeasurementMetric[] = [
+      ...(planHeartRate ? ["heartRate" as const] : []),
+      ...(planRespiratoryRate ? ["respiratoryRate" as const] : []),
+    ];
+    if (!planMedication.trim() || !metrics.length || !times.length || !times.every((time) => /^([01]\d|2[0-3]):[0-5]\d$/.test(time))) return;
+    setMeasurementPlanCode(encodePortable({
+      version: 1, planId: crypto.randomUUID(), medicationName: planMedication.trim(), metrics, times,
+      note: planNote.trim() || undefined, createdAt: new Date().toISOString(),
+    }));
   };
 
   const issueCertification = async () => {
@@ -213,6 +240,17 @@ export default function Home() {
               </div>
             </div>
           )}
+        </section>
+
+        <section className="portal-card">
+          <h2>Create a measurement plan</h2>
+          <p className="helper">Choose when the patient should measure heart rate, experimental breathing rate, or both. This never schedules medication-taking reminders.</p>
+          <div className="field"><label htmlFor="plan-medication">Medication this monitoring relates to</label><input id="plan-medication" value={planMedication} onChange={(event) => setPlanMedication(event.target.value)} placeholder="e.g. alprazolam" /></div>
+          <div className="field"><label htmlFor="plan-times">Daily measurement times</label><input id="plan-times" value={planTimes} onChange={(event) => setPlanTimes(event.target.value)} placeholder="09:00, 17:00" /><p className="helper">Use 24-hour times separated by commas.</p></div>
+          <div className="field"><label><input type="checkbox" checked={planHeartRate} onChange={(event) => setPlanHeartRate(event.target.checked)} /> Heart rate</label><label><input type="checkbox" checked={planRespiratoryRate} onChange={(event) => setPlanRespiratoryRate(event.target.checked)} /> Breathing rate (experimental)</label></div>
+          <div className="field"><label htmlFor="plan-note">Patient-facing note (optional)</label><textarea id="plan-note" rows={3} value={planNote} onChange={(event) => setPlanNote(event.target.value)} placeholder="Why these measurements are useful" /></div>
+          <button className="primary" onClick={createMeasurementPlan} disabled={!planMedication.trim() || (!planHeartRate && !planRespiratoryRate)}>Create patient code</button>
+          {measurementPlanCode && <div className="issued-keys"><div className="field"><label htmlFor="measurement-plan-code">Measurement-plan code</label><textarea id="measurement-plan-code" readOnly rows={6} value={measurementPlanCode} /></div><p className="helper">Give this code to the patient using your normal approved communication method. It contains only the medication name, measurement types, times and note—no patient identity or clinical record.</p></div>}
         </section>
 
         <section className="portal-card">

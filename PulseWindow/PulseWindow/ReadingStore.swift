@@ -6,22 +6,25 @@ struct PulseReading: Identifiable, Codable, Hashable {
     let id: UUID
     let date: Date
     let bpm: Double
+    let respiratoryRate: Double?
     let context: String
 
-    init(id: UUID = UUID(), date: Date = Date(), bpm: Double, context: String = "Routine check") {
+    init(id: UUID = UUID(), date: Date = Date(), bpm: Double, respiratoryRate: Double? = nil, context: String = "Routine check") {
         self.id = id
         self.date = date
         self.bpm = bpm
+        self.respiratoryRate = respiratoryRate
         self.context = context
     }
 
-    private enum CodingKeys: String, CodingKey { case id, date, bpm, context }
+    private enum CodingKeys: String, CodingKey { case id, date, bpm, respiratoryRate, context }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         id = try values.decode(UUID.self, forKey: .id)
         date = try values.decode(Date.self, forKey: .date)
         bpm = try values.decode(Double.self, forKey: .bpm)
+        respiratoryRate = try values.decodeIfPresent(Double.self, forKey: .respiratoryRate)
         context = try values.decodeIfPresent(String.self, forKey: .context) ?? "Routine check"
     }
 }
@@ -46,6 +49,7 @@ struct Medication: Identifiable, Codable, Hashable {
     var checkTiming: String?
     var checkOffsetMinutes: [Int]?
     var checkTimes: [Date]?
+    var measurementMetrics: [String]?
 
     init(
         id: UUID = UUID(),
@@ -66,7 +70,8 @@ struct Medication: Identifiable, Codable, Hashable {
         formulation: String? = nil,
         checkTiming: String? = nil,
         checkOffsetMinutes: [Int]? = nil,
-        checkTimes: [Date]? = nil
+        checkTimes: [Date]? = nil,
+        measurementMetrics: [String]? = nil
     ) {
         self.id = id
         self.name = name
@@ -87,6 +92,7 @@ struct Medication: Identifiable, Codable, Hashable {
         self.checkTiming = checkTiming
         self.checkOffsetMinutes = checkOffsetMinutes
         self.checkTimes = checkTimes
+        self.measurementMetrics = measurementMetrics
     }
 }
 
@@ -135,6 +141,14 @@ struct DoseEvent: Identifiable, Codable, Hashable {
         medicationName = medication.name
         self.date = date
     }
+}
+
+private struct DoctorMeasurementPlan: Decodable {
+    let version: Int
+    let medicationName: String
+    let metrics: [String]
+    let times: [String]
+    let note: String?
 }
 
 @MainActor
@@ -260,11 +274,12 @@ final class ReadingStore: ObservableObject {
     }
 
     @discardableResult
-    func save(bpm: Double) -> PulseReading {
+    func save(bpm: Double, respiratoryRate: Double? = nil) -> PulseReading {
         let now = Date()
         let reading = PulseReading(
             date: now,
             bpm: bpm.rounded(toPlaces: 1),
+            respiratoryRate: respiratoryRate?.rounded(toPlaces: 1),
             context: readingContext(at: now)
         )
         readings.append(reading)
@@ -324,6 +339,38 @@ final class ReadingStore: ObservableObject {
         persist(bloodPressure, key: bloodPressureKey)
     }
 
+    func importMeasurementPlan(_ code: String) throws -> String {
+        var base64 = code.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
+        guard let data = Data(base64Encoded: base64) else { throw CocoaError(.fileReadCorruptFile) }
+        let plan = try JSONDecoder().decode(DoctorMeasurementPlan.self, from: data)
+        guard plan.version == 1, !plan.medicationName.trimmingCharacters(in: .whitespaces).isEmpty,
+              !plan.metrics.isEmpty, plan.metrics.allSatisfy({ $0 == "heartRate" || $0 == "respiratoryRate" }),
+              !plan.times.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "en_US_POSIX"); formatter.dateFormat = "HH:mm"
+        let times = try plan.times.map { value -> Date in
+            guard let parsed = formatter.date(from: value) else { throw CocoaError(.fileReadCorruptFile) }
+            return parsed
+        }
+        if let index = medications.firstIndex(where: { $0.name.caseInsensitiveCompare(plan.medicationName) == .orderedSame }) {
+            medications[index].checkTimes = times
+            medications[index].checkPlan = times.count
+            medications[index].measurementMetrics = plan.metrics
+            medications[index].checkTiming = plan.note ?? "Measurement plan supplied by the care team."
+            scheduleReminders(for: medications[index])
+        } else {
+            let medication = Medication(name: plan.medicationName, dose: "", usualTime: times[0],
+                                        checkPlan: times.count, checkTiming: plan.note ?? "Measurement plan supplied by the care team.",
+                                        checkTimes: times, measurementMetrics: plan.metrics)
+            medications.append(medication)
+            scheduleReminders(for: medication)
+        }
+        persist(medications, key: medicationsKey)
+        return "Imported measurement reminders for \(plan.medicationName). No medication-taking reminder was created."
+    }
+
     func addSymptom(_ symptom: String, severity: String, note: String) {
         symptoms.append(SymptomEntry(
             symptom: symptom.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -371,12 +418,17 @@ final class ReadingStore: ObservableObject {
         }
         rows += [
             "",
-            "PULSE MEASUREMENTS",
-            "Date,Time,BPM,Context,Source",
+            "CAMERA MEASUREMENTS",
+            "Date,Time,BPM,Respiratory rate (breaths/min experimental),Context,Source",
         ]
         let day = DateFormatter(); day.dateFormat = "yyyy-MM-dd"
         let time = DateFormatter(); time.dateFormat = "HH:mm"
-        rows += readings.map { [day.string(from: $0.date), time.string(from: $0.date), String($0.bpm), $0.context, "PulseWindow camera estimate"].map(Self.csvCell).joined(separator: ",") }
+        rows += readings.map { reading in
+            let breathing = reading.respiratoryRate.map { String($0) } ?? ""
+            return [day.string(from: reading.date), time.string(from: reading.date), String(reading.bpm),
+                    breathing, reading.context, "PulseWindow camera estimate"]
+                .map(Self.csvCell).joined(separator: ",")
+        }
         rows += ["", "DOSES TAKEN", "Date,Time,Medication"]
         rows += doses.map { [day.string(from: $0.date), time.string(from: $0.date), $0.medicationName].map(Self.csvCell).joined(separator: ",") }
         rows += ["", "BLOOD PRESSURE", "Date,Time,Systolic,Diastolic,Unit,Source"]
@@ -406,18 +458,6 @@ final class ReadingStore: ObservableObject {
             guard granted else { return }
             let center = UNUserNotificationCenter.current()
             let calendar = Calendar.current
-            let doseComponents = calendar.dateComponents([.hour, .minute], from: medication.usualTime)
-
-            let doseContent = UNMutableNotificationContent()
-            doseContent.title = "Medication check-in"
-            doseContent.body = "If you took \(medication.name), log the dose in PulseWindow."
-            doseContent.sound = .default
-            center.add(UNNotificationRequest(
-                identifier: "dose-\(medication.id)",
-                content: doseContent,
-                trigger: UNCalendarNotificationTrigger(dateMatching: doseComponents, repeats: true)
-            ))
-
             let reminderPlans: [(Date, String)]
             if let times = medication.checkTimes, !times.isEmpty {
                 reminderPlans = times.map { ($0, "Time for the planned resting pulse check") }
@@ -430,8 +470,12 @@ final class ReadingStore: ObservableObject {
             }
             for (index, plan) in reminderPlans.enumerated() {
                 let content = UNMutableNotificationContent()
-                content.title = "Pulse check"
-                content.body = "\(plan.1) for \(medication.name). Use the plan confirmed by your clinician."
+                let metrics = medication.measurementMetrics ?? ["heartRate"]
+                let title = metrics.contains("respiratoryRate")
+                    ? (metrics.contains("heartRate") ? "Heart and breathing-rate measurement" : "Breathing-rate measurement")
+                    : "Heart-rate measurement"
+                content.title = title
+                content.body = "\(plan.1) for \(medication.name). This is a measurement reminder, not a reminder to take medicine."
                 content.sound = .default
                 let components = calendar.dateComponents([.hour, .minute], from: plan.0)
                 center.add(UNNotificationRequest(
@@ -468,7 +512,7 @@ final class ReadingStore: ObservableObject {
     }
 
     private func reminderIDs(for medication: Medication) -> [String] {
-        ["dose-\(medication.id)"] + (0..<8).map { "check-\(medication.id)-\($0)" }
+        (0..<8).map { "check-\(medication.id)-\($0)" }
     }
 
     private func load<T: Decodable>(_ type: [T].Type, key: String) -> [T] {

@@ -274,6 +274,7 @@ private struct MedicationsView: View {
     @State private var showingAdd = false
     @State private var medicationToDelete: Medication?
     @State private var doseMessage: String?
+    @State private var showingPlanImport = false
 
     var body: some View {
         ScrollView {
@@ -291,6 +292,11 @@ private struct MedicationsView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(PrimaryButtonStyle())
+
+                Button { showingPlanImport = true } label: {
+                    Label("Import doctor measurement plan", systemImage: "doc.badge.plus").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SecondaryButtonStyle())
 
                 if store.medications.isEmpty {
                     EmptyCard(icon: "pill", title: "No medicines yet",
@@ -412,6 +418,7 @@ private struct MedicationsView: View {
         .navigationTitle("Medicines")
         .navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $showingAdd) { AddMedicationView() }
+        .sheet(isPresented: $showingPlanImport) { MeasurementPlanImportView() }
         .alert("Remove medicine?", isPresented: Binding(
             get: { medicationToDelete != nil },
             set: { if !$0 { medicationToDelete = nil } }
@@ -423,6 +430,32 @@ private struct MedicationsView: View {
             }
         } message: {
             Text("This removes the medicine and its future reminders. Saved pulse readings will remain.")
+        }
+    }
+}
+
+private struct MeasurementPlanImportView: View {
+    @EnvironmentObject private var store: ReadingStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var code = ""
+    @State private var message: String?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Doctor measurement-plan code") {
+                    TextEditor(text: $code).frame(minHeight: 150).font(.system(.caption, design: .monospaced))
+                    Text("This schedules heart-rate or experimental breathing-rate measurements only. It never reminds you to take medicine.")
+                        .font(.footnote).foregroundStyle(Color.pulseMuted)
+                }
+                if let message { Section { Text(message).foregroundStyle(message.hasPrefix("Imported") ? Color.pulseGreen : Color.pulseRed) } }
+                Button("Import measurement reminders") {
+                    do { message = try store.importMeasurementPlan(code) }
+                    catch { message = "That code could not be read. Ask the doctor to copy the full code again." }
+                }.disabled(code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .navigationTitle("Import plan")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
     }
 }
@@ -602,9 +635,18 @@ private struct MonitorView: View {
                         Text("BPM").font(.caption.bold()).foregroundStyle(Color.pulseMuted)
                         Spacer()
                     }
+                    HStack {
+                        Image(systemName: "lungs.fill").foregroundStyle(Color.pulseGreen)
+                        Text(monitor.respiratoryRate.map { "\(Int($0.rounded())) breaths/min" } ?? "Breathing rate building…")
+                            .font(.headline.monospacedDigit())
+                        Text("EXPERIMENTAL").font(.caption2.bold()).foregroundStyle(Color.pulseMuted)
+                        Spacer()
+                    }
                     if let remaining = monitor.calibrationRemaining { CalibrationView(remaining: remaining) }
                     Text(monitor.status).font(.body.weight(.medium)).foregroundStyle(Color.pulseMuted)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    Text("Breathing rate needs about 30–40 seconds. Do not use it to detect respiratory depression or emergencies.")
+                        .font(.caption).foregroundStyle(Color.pulseMuted).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .cardStyle()
 
@@ -617,8 +659,9 @@ private struct MonitorView: View {
 
                 Button {
                     guard let bpm = monitor.bpm else { return }
-                    let reading = store.save(bpm: bpm)
-                    saveMessage = "Saved \(Int(bpm.rounded())) BPM · \(reading.context)"
+                    let reading = store.save(bpm: bpm, respiratoryRate: monitor.respiratoryRate)
+                    let breathing = monitor.respiratoryRate.map { " · \(Int($0.rounded())) breaths/min experimental" } ?? ""
+                    saveMessage = "Saved \(Int(bpm.rounded())) BPM\(breathing) · \(reading.context)"
                 } label: {
                     Label("Save measurement", systemImage: "square.and.arrow.down").frame(maxWidth: .infinity)
                 }
@@ -646,6 +689,7 @@ private struct HistoryView: View {
     @State private var symptom = ""
     @State private var severity = "Mild"
     @State private var symptomNote = ""
+    @State private var showingCaregiverView = false
 
     private var average: Double {
         store.readings.isEmpty ? 0 : store.readings.map(\.bpm).reduce(0, +) / Double(store.readings.count)
@@ -701,7 +745,12 @@ private struct HistoryView: View {
                                 Text(reading.context).font(.caption).foregroundStyle(Color.pulseMuted)
                             }
                             Spacer()
-                            Text("\(Int(reading.bpm.rounded())) BPM").font(.headline.monospacedDigit()).foregroundStyle(Color.pulseGreen)
+                            VStack(alignment: .trailing) {
+                                Text("\(Int(reading.bpm.rounded())) BPM").font(.headline.monospacedDigit()).foregroundStyle(Color.pulseGreen)
+                                if let breathing = reading.respiratoryRate {
+                                    Text("\(Int(breathing.rounded())) breaths/min · experimental").font(.caption).foregroundStyle(Color.pulseMuted)
+                                }
+                            }
                         }
                         .padding(15).background(Color.white, in: RoundedRectangle(cornerRadius: 16))
                     }
@@ -773,6 +822,11 @@ private struct HistoryView: View {
                 }
                 .buttonStyle(SecondaryButtonStyle())
 
+                Button { showingCaregiverView = true } label: {
+                    Label("Open read-only caregiver view", systemImage: "person.2.fill").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(SecondaryButtonStyle())
+
                 Text("Review exported estimates with a qualified healthcare professional. Do not change medication based on this app alone.")
                     .font(.footnote).foregroundStyle(Color.pulseMuted)
             }
@@ -780,6 +834,39 @@ private struct HistoryView: View {
         }
         .background(Color.pulseBackground.ignoresSafeArea())
         .navigationTitle("History").navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showingCaregiverView) { CaregiverSummaryView() }
+    }
+}
+
+private struct CaregiverSummaryView: View {
+    @EnvironmentObject private var store: ReadingStore
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Read-only care summary").font(.largeTitle.bold()).foregroundStyle(Color.pulseInk)
+                    Text("This view can be shown to a trusted caregiver. It cannot change medicines, reminders, or saved information.").foregroundStyle(Color.pulseMuted)
+                    ForEach(store.medications) { medication in
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(medication.name).font(.headline)
+                            Text(medication.dose.isEmpty ? "Dose not recorded" : medication.dose)
+                            if let directions = medication.prescribedDirections, !directions.isEmpty { Text(directions).foregroundStyle(Color.pulseMuted) }
+                        }.cardStyle()
+                    }
+                    Text("Recent measurements").font(.title2.bold())
+                    ForEach(store.readings.suffix(20).reversed()) { reading in
+                        HistoryRow(icon: "heart.fill", title: "\(Int(reading.bpm.rounded())) BPM",
+                                   detail: reading.respiratoryRate.map { "\(Int($0.rounded())) breaths/min (experimental) · \(reading.context)" } ?? reading.context,
+                                   date: reading.date)
+                    }
+                    Text("Breathing rate is experimental and must not be used to detect respiratory depression or emergencies.").font(.footnote).foregroundStyle(Color.pulseMuted)
+                }.padding(18)
+            }
+            .background(Color.pulseBackground.ignoresSafeArea())
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
     }
 }
 

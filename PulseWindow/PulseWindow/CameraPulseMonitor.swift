@@ -150,6 +150,7 @@ final class CameraPulseMonitor: ObservableObject {
     private static let analysisWindowSeconds = 20.0
 
     @Published var bpm: Double?
+    @Published var respiratoryRate: Double?
     @Published var status = "Ready to measure"
     @Published var isMonitoring = false
     @Published var calibrationRemaining: Int?
@@ -175,6 +176,8 @@ final class CameraPulseMonitor: ObservableObject {
     private let processor = CameraFrameProcessor()
     private let videoQueue = DispatchQueue(label: "pulse-window-video", qos: .userInitiated)
     private var regionSamples: [[TimedSample]] = [[], [], []]
+    private var respirationSamples: [TimedSample] = []
+    private var respirationCandidates: [Double] = []
     private var candidates: [Double] = []
     private var pendingJump: [Double] = []
     private var lastEstimateTime = 0.0
@@ -335,6 +338,8 @@ final class CameraPulseMonitor: ObservableObject {
 
     private func resetSignal(keepBPM: Bool = false) {
         regionSamples = [[], [], []]
+        respirationSamples.removeAll()
+        respirationCandidates.removeAll()
         candidates.removeAll()
         pendingJump.removeAll()
         lastEstimateTime = 0
@@ -346,7 +351,7 @@ final class CameraPulseMonitor: ObservableObject {
         calibrationRemaining = Int(Self.initialCalibrationSeconds)
         greenWaveform.removeAll()
         greenBaseline = nil
-        if !keepBPM { bpm = nil }
+        if !keepBPM { bpm = nil; respiratoryRate = nil }
     }
 
     private func handle(_ result: CameraFrameResult) {
@@ -419,6 +424,7 @@ final class CameraPulseMonitor: ObservableObject {
             regionSamples = regionSamples.map { region in
                 region.map { TimedSample(time: $0.time + duration, rgb: $0.rgb) }
             }
+            respirationSamples = respirationSamples.map { TimedSample(time: $0.time + duration, rgb: $0.rgb) }
             colourOffsets = result.regions.enumerated().map { index, colour in
                 guard let previous = regionSamples[index].last?.rgb else { return .zero }
                 return RGBValue(
@@ -443,6 +449,15 @@ final class CameraPulseMonitor: ObservableObject {
                 result.timestamp - $0.time > Self.analysisWindowSeconds + 0.5
             }
         }
+        respirationSamples.append(TimedSample(
+            time: result.timestamp,
+            rgb: RGBValue(
+                red: Self.median(corrected.map(\.red)),
+                green: Self.median(corrected.map(\.green)),
+                blue: Self.median(corrected.map(\.blue))
+            )
+        ))
+        respirationSamples.removeAll { result.timestamp - $0.time > 40.5 }
         updateGreenWaveform(result.regions)
 
         guard let firstTime = regionSamples[0].first?.time else { return }
@@ -455,6 +470,16 @@ final class CameraPulseMonitor: ObservableObject {
         calibrationRemaining = nil
         guard result.timestamp - lastEstimateTime >= 1 else { return }
         lastEstimateTime = result.timestamp
+
+        if let breathing = Self.estimateRespiratoryRate(respirationSamples) {
+            respirationCandidates.append(breathing)
+            respirationCandidates = Array(respirationCandidates.suffix(5))
+            let recentBreathing = Array(respirationCandidates.suffix(3))
+            if recentBreathing.count == 3,
+               (recentBreathing.max()! - recentBreathing.min()!) <= 3 {
+                respiratoryRate = Self.median(recentBreathing)
+            }
+        }
 
         let estimates = regionSamples.compactMap(Self.estimateBPM)
             .filter { $0.quality >= 0.18 }
@@ -527,6 +552,46 @@ final class CameraPulseMonitor: ObservableObject {
                 )
             )
         }
+    }
+
+    private static func estimateRespiratoryRate(_ samples: [TimedSample]) -> Double? {
+        guard samples.count >= 250, let first = samples.first, let last = samples.last,
+              last.time - first.time >= 30 else { return nil }
+        let frameRate = 10.0
+        let count = Int((last.time - first.time) * frameRate)
+        guard count >= 300 else { return nil }
+        var values = [Double]()
+        var source = 0
+        for index in 0..<count {
+            let time = first.time + Double(index) / frameRate
+            while source + 1 < samples.count, samples[source + 1].time < time { source += 1 }
+            guard source + 1 < samples.count else { break }
+            let a = samples[source], b = samples[source + 1]
+            let fraction = (time - a.time) / max(b.time - a.time, 1e-6)
+            let red = a.rgb.red + (b.rgb.red - a.rgb.red) * fraction
+            let green = a.rgb.green + (b.rgb.green - a.rgb.green) * fraction
+            let blue = a.rgb.blue + (b.rgb.blue - a.rgb.blue) * fraction
+            values.append(0.5 * green + 0.25 * red + 0.25 * blue)
+        }
+        guard values.count >= 300 else { return nil }
+        let slope = (values.last! - values.first!) / Double(max(1, values.count - 1))
+        let signal = values.enumerated().map { $0.element - values[0] - slope * Double($0.offset) }
+        var powers = [(rate: Double, power: Double)]()
+        for rate in stride(from: 6.0, through: 30.0, by: 0.25) {
+            var real = 0.0, imaginary = 0.0
+            for (index, value) in signal.enumerated() {
+                let hann = 0.5 - 0.5 * cos(2 * .pi * Double(index) / Double(max(1, signal.count - 1)))
+                let angle = 2 * .pi * (rate / 60) * Double(index) / frameRate
+                real += value * hann * cos(angle)
+                imaginary -= value * hann * sin(angle)
+            }
+            powers.append((rate, real * real + imaginary * imaginary))
+        }
+        guard let peak = powers.max(by: { $0.power < $1.power }) else { return nil }
+        let total = powers.reduce(0) { $0 + $1.power }
+        let local = powers.filter { abs($0.rate - peak.rate) <= 2 }.reduce(0) { $0 + $1.power }
+        guard total > 0, local / total >= 0.28 else { return nil }
+        return peak.rate
     }
 
     private static func regionConsensus(_ estimates: [Estimate]) -> Estimate? {

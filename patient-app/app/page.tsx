@@ -39,6 +39,7 @@ import MenuItem from "@mui/material/MenuItem";
 import Paper from "@mui/material/Paper";
 import Select from "@mui/material/Select";
 import Stack from "@mui/material/Stack";
+import Switch from "@mui/material/Switch";
 import TextField from "@mui/material/TextField";
 import Typography from "@mui/material/Typography";
 import ExpandMoreIcon from "@mui/icons-material/ExpandMore";
@@ -53,6 +54,7 @@ import AutorenewIcon from "@mui/icons-material/Autorenew";
 import CheckCircleIcon from "@mui/icons-material/CheckCircle";
 import NotificationsIcon from "@mui/icons-material/Notifications";
 import RepeatIcon from "@mui/icons-material/Repeat";
+import VerifiedUserIcon from "@mui/icons-material/VerifiedUser";
 
 type Screen = "vitals" | "medicine" | "data" | "caregiver";
 type Camera = { deviceId: string; label: string };
@@ -144,6 +146,7 @@ const BLOOD_PRESSURE_KEY = "pulse-window-blood-pressure";
 const SYMPTOMS_KEY = "pulse-window-symptoms";
 const PUBLIC_KEY_STORAGE_KEY = "pulse-window-public-key";
 const PRIVATE_KEY_STORAGE_KEY = "pulse-window-private-key";
+const SECURE_REPORTS_KEY = "pulse-window-secure-reports-enabled";
 const MEDICATION_PRESETS: MedicationPreset[] = [
   {
     id: "sotalol", name: "Sotalol", routineChecks: 2, changeChecks: 3,
@@ -1008,6 +1011,7 @@ export default function Home() {
   const [keySetupError, setKeySetupError] = useState("");
   const [keySetupSaving, setKeySetupSaving] = useState(false);
   const [showKeySetup, setShowKeySetup] = useState(false);
+  const [secureReportsEnabled, setSecureReportsEnabled] = useState(true);
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">("unsupported");
   const [clock, setClock] = useState(() => new Date());
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -1068,6 +1072,8 @@ export default function Home() {
 
       setPublicKey(localStorage.getItem(PUBLIC_KEY_STORAGE_KEY));
       setPrivateKey(localStorage.getItem(PRIVATE_KEY_STORAGE_KEY));
+      const storedSecureReports = localStorage.getItem(SECURE_REPORTS_KEY);
+      if (storedSecureReports !== null) setSecureReportsEnabled(storedSecureReports === "true");
       setKeysLoaded(true);
       setNotificationPermission("Notification" in window ? Notification.permission : "unsupported");
     }, 0);
@@ -2179,8 +2185,16 @@ export default function Home() {
     return doc.output("arraybuffer") as ArrayBuffer;
   };
 
-  const exportSignedReport = async () => {
-    if (!publicKey || !privateKey) {
+  const toggleSecureReports = (enabled: boolean) => {
+    setSecureReportsEnabled(enabled);
+    localStorage.setItem(SECURE_REPORTS_KEY, String(enabled));
+    if (enabled && (!publicKey || !privateKey)) {
+      setShowKeySetup(true);
+    }
+  };
+
+  const exportReport = async () => {
+    if (secureReportsEnabled && (!publicKey || !privateKey)) {
       setShowKeySetup(true);
       return;
     }
@@ -2188,16 +2202,20 @@ export default function Home() {
     try {
       const reportBytes = buildAnalyticalReportPdfBytes();
       const csvBytes = new TextEncoder().encode(buildRawDataCsv()).buffer;
-      const key = await importSigningPrivateKeyBase64(privateKey);
-      // Sign both files together (report bytes then CSV bytes) so tampering
-      // with either one after export breaks verification, not just the PDF.
-      const signature = await signReportBytes(key, concatArrayBuffers(reportBytes, csvBytes));
       const entries: ExportEntry[] = [
         { path: "AnalyticalReport.pdf", data: reportBytes },
         { path: "Raw data.csv", data: csvBytes },
-        { path: "DigitalSignature/hash.txt", data: signature },
-        { path: "DigitalSignature/public.txt", data: publicKey },
       ];
+      if (secureReportsEnabled) {
+        const key = await importSigningPrivateKeyBase64(privateKey!);
+        // Sign both files together (report bytes then CSV bytes) so tampering
+        // with either one after export breaks verification, not just the PDF.
+        const signature = await signReportBytes(key, concatArrayBuffers(reportBytes, csvBytes));
+        entries.push(
+          { path: "DigitalSignature/hash.txt", data: signature },
+          { path: "DigitalSignature/public.txt", data: publicKey! },
+        );
+      }
       const folderName = `PulseWindowReporting-${formatDateTimeForFilename(new Date())}`;
 
       if (typeof window.showDirectoryPicker === "function") {
@@ -2220,8 +2238,12 @@ export default function Home() {
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
-      console.error("Could not export the signed report", error);
-      setPatientNotice("Could not export the report — check your saved keys and try again.");
+      console.error("Could not export the report", error);
+      setPatientNotice(
+        secureReportsEnabled
+          ? "Could not export the report — check your saved keys and try again."
+          : "Could not export the report — try again.",
+      );
     }
   };
 
@@ -3184,9 +3206,31 @@ export default function Home() {
               );
             })()}
 
-            <Stack direction="row" spacing={1.5} sx={{ mt: 2 }}>
-              <Button variant="outlined" fullWidth size="large" onClick={exportSignedReport}>
-                Export report
+            <Card variant="outlined" sx={{ mt: 2 }}>
+              <CardContent>
+                <Stack direction="row" spacing={1.5} sx={{ alignItems: "center", justifyContent: "space-between" }}>
+                  <Stack direction="row" spacing={1.5} sx={{ alignItems: "center" }}>
+                    <VerifiedUserIcon color={secureReportsEnabled ? "primary" : "action"} />
+                    <Box>
+                      <Typography sx={{ fontWeight: 800 }}>Secure (signed) reports</Typography>
+                      <Typography variant="body2" color="text.secondary">
+                        {secureReportsEnabled
+                          ? "Exports are signed so a doctor can verify they're unaltered."
+                          : "Exports are plain — no signature, no keys needed."}
+                      </Typography>
+                    </Box>
+                  </Stack>
+                  <Switch
+                    checked={secureReportsEnabled}
+                    onChange={(event) => toggleSecureReports(event.target.checked)}
+                    slotProps={{ input: { "aria-label": "Toggle secure signed reports" } }}
+                  />
+                </Stack>
+              </CardContent>
+            </Card>
+            <Stack direction="row" spacing={1.5} sx={{ mt: 1.5 }}>
+              <Button variant="outlined" fullWidth size="large" onClick={exportReport}>
+                {secureReportsEnabled ? "Export signed report" : "Export report"}
               </Button>
               <Button variant="outlined" fullWidth size="large" onClick={openCaregiverView}>
                 Open caregiver view

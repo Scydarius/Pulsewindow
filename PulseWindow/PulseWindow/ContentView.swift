@@ -618,7 +618,7 @@ private struct MonitorView: View {
         ScrollView {
             VStack(spacing: 16) {
                 ZStack(alignment: .bottom) {
-                    CameraPreview(session: monitor.session, faceBox: monitor.faceBox,
+                    CameraPreview(session: monitor.session, faceBox: monitor.faceBox, bodyRegions: monitor.bodyRegions,
                                   mirrored: monitor.isFrontCamera, frameSize: monitor.videoFrameSize)
                         .overlay { if monitor.developerMode { Color.green.opacity(0.28).blendMode(.color) } }
                     if monitor.developerMode { GreenWaveformView(samples: monitor.greenWaveform).padding(12) }
@@ -642,10 +642,13 @@ private struct MonitorView: View {
                         Text("EXPERIMENTAL").font(.caption2.bold()).foregroundStyle(Color.pulseMuted)
                         Spacer()
                     }
+                    Text(monitor.respirationStatus)
+                        .font(.subheadline.weight(.semibold)).foregroundStyle(Color.cyan.opacity(0.85))
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     if let remaining = monitor.calibrationRemaining { CalibrationView(remaining: remaining) }
                     Text(monitor.status).font(.body.weight(.medium)).foregroundStyle(Color.pulseMuted)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    Text("Breathing rate needs about 30–40 seconds. Do not use it to detect respiratory depression or emergencies.")
+                    Text("Sit far enough back to show your face, shoulders and upper chest. Breathing rate needs about 25–40 seconds. Do not use it to detect respiratory depression or emergencies.")
                         .font(.caption).foregroundStyle(Color.pulseMuted).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .cardStyle()

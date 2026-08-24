@@ -4,6 +4,7 @@ import SwiftUI
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     let faceBox: CGRect?
+    let bodyRegions: [CGRect]
     let mirrored: Bool
     let frameSize: CGSize
 
@@ -11,7 +12,7 @@ struct CameraPreview: UIViewRepresentable {
         let view = PreviewView()
         view.previewLayer.session = session
         view.previewLayer.videoGravity = .resizeAspectFill
-        view.update(faceBox: faceBox, mirrored: mirrored, frameSize: frameSize)
+        view.update(faceBox: faceBox, bodyRegions: bodyRegions, mirrored: mirrored, frameSize: frameSize)
         return view
     }
 
@@ -19,14 +20,16 @@ struct CameraPreview: UIViewRepresentable {
         if uiView.previewLayer.session !== session {
             uiView.previewLayer.session = session
         }
-        uiView.update(faceBox: faceBox, mirrored: mirrored, frameSize: frameSize)
+        uiView.update(faceBox: faceBox, bodyRegions: bodyRegions, mirrored: mirrored, frameSize: frameSize)
     }
 }
 
 final class PreviewView: UIView {
     private let faceLayer = CAShapeLayer()
     private let regionLayer = CAShapeLayer()
+    private let bodyLayer = CAShapeLayer()
     private var currentFaceBox: CGRect?
+    private var currentBodyRegions: [CGRect] = []
     private var mirrored = false
     private var frameSize = CGSize(width: 3, height: 4)
 
@@ -44,8 +47,12 @@ final class PreviewView: UIView {
         regionLayer.fillColor = UIColor.clear.cgColor
         regionLayer.strokeColor = UIColor.systemYellow.cgColor
         regionLayer.lineWidth = 2
+        bodyLayer.fillColor = UIColor.systemCyan.withAlphaComponent(0.08).cgColor
+        bodyLayer.strokeColor = UIColor.systemCyan.cgColor
+        bodyLayer.lineWidth = 2
         previewLayer.addSublayer(faceLayer)
         previewLayer.addSublayer(regionLayer)
+        previewLayer.addSublayer(bodyLayer)
     }
 
     required init?(coder: NSCoder) {
@@ -57,8 +64,9 @@ final class PreviewView: UIView {
         drawTrackingOverlay()
     }
 
-    func update(faceBox: CGRect?, mirrored: Bool, frameSize: CGSize) {
+    func update(faceBox: CGRect?, bodyRegions: [CGRect], mirrored: Bool, frameSize: CGSize) {
         currentFaceBox = faceBox
+        currentBodyRegions = bodyRegions
         self.mirrored = mirrored
         if frameSize.width > 0, frameSize.height > 0 {
             self.frameSize = frameSize
@@ -78,11 +86,11 @@ final class PreviewView: UIView {
         let shownFace: CGRect
         if mirrored {
             // The front camera uses a stable target that is easier to follow.
-            let guideWidth = bounds.width * 0.62
-            let guideHeight = min(bounds.height * 0.58, guideWidth * 1.12)
+            let guideWidth = bounds.width * 0.48
+            let guideHeight = min(bounds.height * 0.42, guideWidth * 1.08)
             shownFace = CGRect(
                 x: (bounds.width - guideWidth) / 2,
-                y: (bounds.height - guideHeight) / 2,
+                y: bounds.height * 0.12,
                 width: guideWidth,
                 height: guideHeight
             )
@@ -97,6 +105,7 @@ final class PreviewView: UIView {
             guard let box = currentFaceBox else {
                 faceLayer.path = nil
                 regionLayer.path = nil
+                bodyLayer.path = nil
                 return
             }
             let scale = max(
@@ -141,6 +150,30 @@ final class PreviewView: UIView {
             path.append(UIBezierPath(roundedRect: region, cornerRadius: 6))
         }
         regionLayer.path = path.cgPath
+
+        let bodyPath = UIBezierPath()
+        if currentBodyRegions.isEmpty, mirrored {
+            let guide = CGRect(x: bounds.width * 0.16, y: shownFace.maxY + 18,
+                               width: bounds.width * 0.68,
+                               height: max(36, min(bounds.height * 0.27, bounds.height - shownFace.maxY - 30)))
+            bodyPath.append(UIBezierPath(roundedRect: guide, cornerRadius: 18))
+        }
+        let scale = max(bounds.width / frameSize.width, bounds.height / frameSize.height)
+        let displayedWidth = frameSize.width * scale
+        let displayedHeight = frameSize.height * scale
+        let offsetX = (bounds.width - displayedWidth) / 2
+        let offsetY = (bounds.height - displayedHeight) / 2
+        for region in currentBodyRegions {
+            let normalizedX = mirrored ? 1 - region.maxX : region.minX
+            let shown = CGRect(
+                x: offsetX + normalizedX * displayedWidth,
+                y: offsetY + (1 - region.maxY) * displayedHeight,
+                width: region.width * displayedWidth,
+                height: region.height * displayedHeight
+            )
+            bodyPath.append(UIBezierPath(roundedRect: shown, cornerRadius: 10))
+        }
+        bodyLayer.path = bodyPath.cgPath
     }
 
 }

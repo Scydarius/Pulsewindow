@@ -77,7 +77,7 @@ struct ContentView: View {
             NavigationStack { MedicationsView() }
                 .tabItem { Label("Medicines", systemImage: "pill.fill") }
             NavigationStack { HistoryView() }
-                .tabItem { Label("History", systemImage: "chart.xyaxis.line") }
+                .tabItem { Label("Records", systemImage: "chart.xyaxis.line") }
         }
         .tint(.pulseGreen)
         .preferredColorScheme(.light)
@@ -227,9 +227,9 @@ private struct DashboardView: View {
                 .cardStyle()
 
                 VStack(alignment: .leading, spacing: 14) {
-                    Label("Camera pulse check", systemImage: "camera.fill")
+                    Label("Take a measurement", systemImage: "camera.fill")
                         .font(.headline).foregroundStyle(Color.pulseInk)
-                    Text("Sit still in steady front lighting. Calibration takes 15 seconds, then the app confirms a stable estimate.")
+                    Text("Sit far enough back to show your face, both shoulders and upper chest. Keep still for the full 60-second check so the app can confirm your pulse and attempt an experimental breathing estimate.")
                         .foregroundStyle(Color.pulseMuted)
 
                     if monitor.cameras.isEmpty {
@@ -250,7 +250,7 @@ private struct DashboardView: View {
                     NavigationLink {
                         MonitorView()
                     } label: {
-                        Label("Start pulse measurement", systemImage: "waveform.path.ecg")
+                        Label("Start 60-second check", systemImage: "waveform.path.ecg")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(PrimaryButtonStyle())
@@ -616,46 +616,96 @@ private struct MonitorView: View {
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 16) {
+            VStack(spacing: 22) {
                 ZStack(alignment: .bottom) {
                     CameraPreview(session: monitor.session, faceBox: monitor.faceBox, bodyRegions: monitor.bodyRegions,
                                   mirrored: monitor.isFrontCamera, frameSize: monitor.videoFrameSize)
                         .overlay { if monitor.developerMode { Color.green.opacity(0.28).blendMode(.color) } }
                     if monitor.developerMode { GreenWaveformView(samples: monitor.greenWaveform).padding(12) }
                 }
-                .frame(height: 430).background(Color.black)
+                .frame(height: 360).background(Color.black)
                 .clipShape(RoundedRectangle(cornerRadius: 24))
 
-                VStack(spacing: 14) {
-                    HStack(spacing: 16) {
-                        PulsingHeart(bpm: monitor.bpm, active: monitor.isMonitoring)
-                        Text(monitor.bpm.map { String(Int($0.rounded())) } ?? "—")
-                            .font(.system(size: 54, weight: .bold, design: .rounded))
-                            .monospacedDigit().foregroundStyle(Color.pulseGreen)
-                        Text("BPM").font(.caption.bold()).foregroundStyle(Color.pulseMuted)
-                        Spacer()
+                VStack(spacing: 18) {
+                    HStack(spacing: 12) {
+                        HStack(spacing: 10) {
+                            PulsingHeart(bpm: monitor.bpm, active: monitor.isMonitoring)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("PULSE").font(.caption2.bold()).tracking(1).foregroundStyle(Color.pulseMuted)
+                                HStack(alignment: .firstTextBaseline, spacing: 4) {
+                                    Text(monitor.bpm.map { String(Int($0.rounded())) } ?? "—")
+                                        .font(.system(size: 42, weight: .bold, design: .rounded))
+                                        .monospacedDigit().foregroundStyle(Color.pulseGreen)
+                                    Text("BPM").font(.caption.bold()).foregroundStyle(Color.pulseMuted)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 90, alignment: .leading)
+                        .padding(.horizontal, 14)
+                        .background(Color.pulseGreen.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Label("BREATHING", systemImage: "lungs.fill")
+                                .font(.caption2.bold()).tracking(0.6).foregroundStyle(Color.pulseMuted)
+                            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                                Text(monitor.respiratoryRate.map { String(Int($0.rounded())) } ?? "—")
+                                    .font(.system(size: 34, weight: .bold, design: .rounded))
+                                    .monospacedDigit().foregroundStyle(Color.pulseGreen)
+                                Text("/min").font(.caption.bold()).foregroundStyle(Color.pulseMuted)
+                            }
+                            Text("Experimental").font(.caption2.bold()).foregroundStyle(Color.pulseOrange)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 90, alignment: .leading)
+                        .padding(.horizontal, 14)
+                        .background(Color.pulseSoft, in: RoundedRectangle(cornerRadius: 18))
                     }
-                    HStack {
-                        Image(systemName: "lungs.fill").foregroundStyle(Color.pulseGreen)
-                        Text(monitor.respiratoryRate.map { "\(Int($0.rounded())) breaths/min" } ?? "Breathing rate building…")
-                            .font(.headline.monospacedDigit())
-                        Text("EXPERIMENTAL").font(.caption2.bold()).foregroundStyle(Color.pulseMuted)
-                        Spacer()
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack(alignment: .top, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(monitor.measurementComplete
+                                     ? "Measurement complete"
+                                     : monitor.measurementSeconds < 15 ? "Finding your pulse" : "Confirming your result")
+                                    .font(.headline).foregroundStyle(Color.pulseInk)
+                                Text(progressMessage)
+                                    .font(.subheadline).foregroundStyle(Color.pulseMuted)
+                            }
+                            Spacer()
+                            VStack(alignment: .trailing, spacing: 0) {
+                                Text(monitor.measurementComplete ? "Done" : "\(max(0, 60 - monitor.measurementSeconds))s")
+                                    .font(.title3.bold().monospacedDigit()).foregroundStyle(Color.pulseGreen)
+                                if !monitor.measurementComplete {
+                                    Text("remaining").font(.caption2).foregroundStyle(Color.pulseMuted)
+                                }
+                            }
+                        }
+                        ProgressView(value: Double(monitor.measurementSeconds), total: 60)
+                            .scaleEffect(x: 1, y: 1.35)
+                            .tint(monitor.measurementComplete ? .green : .pulseGreen)
+                        if let quality = monitor.signalQuality {
+                            Label("Pulse signal: \(quality >= 0.45 ? "strong" : "acceptable")",
+                                  systemImage: quality >= 0.45 ? "checkmark.circle.fill" : "waveform.path")
+                                .font(.caption.bold())
+                                .foregroundStyle(quality >= 0.45 ? Color.pulseGreen : Color.pulseOrange)
+                        }
+                        Text(monitor.status)
+                            .font(.subheadline.weight(.semibold)).foregroundStyle(Color.pulseMuted)
                     }
-                    Text(monitor.respirationStatus)
-                        .font(.subheadline.weight(.semibold)).foregroundStyle(Color.cyan.opacity(0.85))
+                    .padding(18)
+                    .background(monitor.measurementComplete ? Color.pulseGreen.opacity(0.07) : Color.pulseSoft,
+                                in: RoundedRectangle(cornerRadius: 18))
+                    Text("Sit far enough back to show your face, shoulders and upper chest. Breathing rate is experimental and must not be used for emergencies.")
+                        .font(.footnote).foregroundStyle(Color.pulseMuted).frame(maxWidth: .infinity, alignment: .leading)
+                    Label(monitor.respirationStatus, systemImage: monitor.respiratoryRate == nil ? "lungs" : "checkmark.circle.fill")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(monitor.respiratoryRate == nil ? Color.pulseMuted : Color.pulseGreen)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    if let remaining = monitor.calibrationRemaining { CalibrationView(remaining: remaining) }
-                    Text(monitor.status).font(.body.weight(.medium)).foregroundStyle(Color.pulseMuted)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Text("Sit far enough back to show your face, shoulders and upper chest. Breathing rate needs about 25–40 seconds. Do not use it to detect respiratory depression or emergencies.")
-                        .font(.caption).foregroundStyle(Color.pulseMuted).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .cardStyle()
 
                 Button { monitor.isMonitoring ? monitor.stop() : monitor.start() } label: {
-                    Label(monitor.isMonitoring ? "Pause measurement" : "Start measurement",
-                          systemImage: monitor.isMonitoring ? "pause.fill" : "play.fill")
+                    Label(monitor.isMonitoring ? "Stop measurement" : "Start new measurement",
+                          systemImage: monitor.isMonitoring ? "stop.fill" : "arrow.clockwise")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(monitor.isMonitoring ? AnyButtonStyle(DangerButtonStyle()) : AnyButtonStyle(PrimaryButtonStyle()))
@@ -666,9 +716,12 @@ private struct MonitorView: View {
                     let breathing = monitor.respiratoryRate.map { " · \(Int($0.rounded())) breaths/min experimental" } ?? ""
                     saveMessage = "Saved \(Int(bpm.rounded())) BPM\(breathing) · \(reading.context)"
                 } label: {
-                    Label("Save measurement", systemImage: "square.and.arrow.down").frame(maxWidth: .infinity)
+                    Label(monitor.measurementComplete ? "Save final result" : "Complete 60 seconds to save",
+                          systemImage: "square.and.arrow.down").frame(maxWidth: .infinity)
                 }
-                .buttonStyle(SecondaryButtonStyle()).disabled(monitor.bpm == nil)
+                .buttonStyle(SecondaryButtonStyle())
+                .disabled(monitor.bpm == nil || !monitor.measurementComplete || monitor.signalQuality == nil
+                          || monitor.respirationStatus.hasPrefix("Pulse complete"))
 
                 Button { monitor.toggleDeveloperMode() } label: {
                     Label(monitor.developerMode ? "Hide developer signal" : "Show developer signal", systemImage: "waveform")
@@ -677,11 +730,27 @@ private struct MonitorView: View {
 
                 if let saveMessage { Label(saveMessage, systemImage: "checkmark.circle.fill").foregroundStyle(Color.pulseGreen).font(.subheadline.bold()) }
             }
-            .padding(16)
+            .padding(.horizontal, 18)
+            .padding(.vertical, 20)
         }
         .background(Color.pulseBackground.ignoresSafeArea())
         .navigationTitle("Pulse check").navigationBarTitleDisplayMode(.inline)
         .onAppear { monitor.start() }.onDisappear { monitor.stopSession() }
+    }
+
+    private var progressMessage: String {
+        if monitor.measurementComplete {
+            if monitor.respirationStatus.hasPrefix("Pulse complete") {
+                return "Your pulse is ready. Keep still briefly while breathing rate is checked."
+            }
+            return monitor.respiratoryRate == nil
+                ? "Your pulse is ready to save. Breathing rate could not be confirmed."
+                : "Your pulse and experimental breathing estimate are ready to save."
+        }
+        if let remaining = monitor.calibrationRemaining {
+            return "Pulse estimate in about \(remaining) seconds. Keep still."
+        }
+        return "Pulse found. Keep still while breathing rate builds."
     }
 }
 
@@ -836,7 +905,7 @@ private struct HistoryView: View {
             .padding(18)
         }
         .background(Color.pulseBackground.ignoresSafeArea())
-        .navigationTitle("History").navigationBarTitleDisplayMode(.inline)
+        .navigationTitle("Records").navigationBarTitleDisplayMode(.inline)
         .sheet(isPresented: $showingCaregiverView) { CaregiverSummaryView() }
     }
 }

@@ -31,6 +31,14 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 
 .portal-page { min-height: 100svh; padding: 34px 20px 80px; }
 .portal-content { width: min(100%, 720px); margin: 0 auto; display: grid; gap: 20px; }
+.portal-brand { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
+.portal-logo {
+  width: 64px;
+  height: 64px;
+  flex: 0 0 64px;
+  border-radius: 16px;
+  background: url("/pulse-window-logo.png") center / cover no-repeat;
+}
 .portal-header h1 { margin: 0 0 10px; font-size: clamp(28px, 5vw, 40px); letter-spacing: -.03em; }
 .eyebrow {
   margin: 0 0 8px;

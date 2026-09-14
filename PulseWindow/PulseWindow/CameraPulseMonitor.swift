@@ -40,6 +40,8 @@ final class CameraFrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBuffer
     private var frameNumber = 0
     private var lastFace: VNFaceObservation?
     private var lastFaceTimestamp = 0.0
+    private var lastBodyRegions = [CGRect]()
+    private var lastBodyTimestamp = 0.0
     private var previousMotionGrids: [[Double]?] = [nil, nil, nil]
     private var cumulativeMotion = [0.0, 0.0, 0.0]
     private var lastMotionTimestamp = 0.0
@@ -59,15 +61,23 @@ final class CameraFrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBuffer
         frameNumber += 1
 
         if frameNumber % 5 == 0 {
-            let request = VNDetectFaceRectanglesRequest()
+            let faceRequest = VNDetectFaceRectanglesRequest()
+            let bodyRequest = VNDetectHumanBodyPoseRequest()
             let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up)
-            try? handler.perform([request])
-            if let face = request.results?.max(by: {
+            try? handler.perform([faceRequest, bodyRequest])
+            if let face = faceRequest.results?.max(by: {
                 $0.boundingBox.width * $0.boundingBox.height <
                     $1.boundingBox.width * $1.boundingBox.height
             }) {
                 lastFace = face
                 lastFaceTimestamp = timestamp
+            }
+            if let body = bodyRequest.results?.first,
+               let left = try? body.recognizedPoint(.leftShoulder),
+               let right = try? body.recognizedPoint(.rightShoulder),
+               let regions = Self.upperBodyRegions(left: left, right: right) {
+                lastBodyRegions = regions
+                lastBodyTimestamp = timestamp
             }
         }
 
@@ -84,7 +94,8 @@ final class CameraFrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBuffer
         }
 
         let colours = Self.averageRegionColours(pixelBuffer, face: face)
-        let motion = measureBodyMotion(pixelBuffer, face: face, timestamp: timestamp)
+        let visibleBodyRegions = timestamp - lastBodyTimestamp <= 0.9 ? lastBodyRegions : []
+        let motion = measureBodyMotion(pixelBuffer, regions: visibleBodyRegions, timestamp: timestamp)
         onResult?(CameraFrameResult(
             timestamp: timestamp,
             frameSize: frameSize,
@@ -97,10 +108,10 @@ final class CameraFrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBuffer
 
     private func measureBodyMotion(
         _ buffer: CVPixelBuffer,
-        face: VNFaceObservation,
+        regions: [CGRect],
         timestamp: Double
     ) -> (regions: [CGRect], values: [Double]?) {
-        guard let regions = Self.upperBodyRegions(face.boundingBox) else {
+        guard regions.count == 3 else {
             previousMotionGrids = [nil, nil, nil]
             return ([], nil)
         }
@@ -122,17 +133,24 @@ final class CameraFrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBuffer
         return (regions, produced ? cumulativeMotion : nil)
     }
 
-    private static func upperBodyRegions(_ face: CGRect) -> [CGRect]? {
-        let availableHeight = face.minY
-        let regionHeight = min(face.height * 0.72, availableHeight - 0.01)
-        guard regionHeight >= max(0.08, face.height * 0.38) else { return nil }
+    private static func upperBodyRegions(
+        left: VNRecognizedPoint,
+        right: VNRecognizedPoint
+    ) -> [CGRect]? {
+        guard left.confidence >= 0.55, right.confidence >= 0.55 else { return nil }
+        let span = abs(right.location.x - left.location.x)
+        let shoulderY = (left.location.y + right.location.y) / 2
+        guard span >= 0.16, shoulderY >= 0.18 else { return nil }
+        let minX = min(left.location.x, right.location.x)
+        let regionHeight = min(span * 0.42, shoulderY - 0.01)
+        guard regionHeight >= 0.08 else { return nil }
         let raw = [
-            CGRect(x: face.minX + face.width * 0.09, y: face.minY - regionHeight,
-                   width: face.width * 0.82, height: regionHeight),
-            CGRect(x: face.minX - face.width * 0.38, y: face.minY - regionHeight * 0.77,
-                   width: face.width * 0.48, height: regionHeight * 0.72),
-            CGRect(x: face.minX + face.width * 0.90, y: face.minY - regionHeight * 0.77,
-                   width: face.width * 0.48, height: regionHeight * 0.72),
+            CGRect(x: minX + span * 0.18, y: shoulderY - span * 0.48,
+                   width: span * 0.64, height: regionHeight),
+            CGRect(x: minX - span * 0.04, y: shoulderY - span * 0.34,
+                   width: span * 0.38, height: regionHeight * 0.72),
+            CGRect(x: minX + span * 0.66, y: shoulderY - span * 0.34,
+                   width: span * 0.38, height: regionHeight * 0.72),
         ]
         return raw.map { $0.intersection(CGRect(x: 0, y: 0, width: 1, height: 1)) }
     }
@@ -173,7 +191,7 @@ final class CameraFrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBuffer
                 denominator += gradient * gradient
             }
         }
-        guard denominator >= 3500 else { return nil }
+        guard denominator >= 700 else { return nil }
         return max(-1.5, min(1.5, -numerator / denominator))
     }
 
@@ -241,6 +259,7 @@ final class CameraFrameProcessor: NSObject, AVCaptureVideoDataOutputSampleBuffer
 final class CameraPulseMonitor: ObservableObject {
     private static let initialCalibrationSeconds = 15.0
     private static let analysisWindowSeconds = 20.0
+    private static let finalMeasurementSeconds = 60.0
 
     @Published var bpm: Double?
     @Published var respiratoryRate: Double?
@@ -248,6 +267,9 @@ final class CameraPulseMonitor: ObservableObject {
     @Published var status = "Ready to measure"
     @Published var isMonitoring = false
     @Published var calibrationRemaining: Int?
+    @Published var measurementSeconds = 0
+    @Published var measurementComplete = false
+    @Published var signalQuality: Double?
     @Published var faceBox: CGRect?
     @Published var bodyRegions: [CGRect] = []
     @Published var videoFrameSize = CGSize(width: 3, height: 4)
@@ -276,8 +298,8 @@ final class CameraPulseMonitor: ObservableObject {
     private let processor = CameraFrameProcessor()
     private let videoQueue = DispatchQueue(label: "pulse-window-video", qos: .userInitiated)
     private var regionSamples: [[TimedSample]] = [[], [], []]
+    private var recordingRegionSamples: [[TimedSample]] = [[], [], []]
     private var respirationSamples: [[TimedMotionSample]] = [[], [], []]
-    private var respirationCandidates: [Double] = []
     private var candidates: [Double] = []
     private var pendingJump: [Double] = []
     private var lastEstimateTime = 0.0
@@ -289,6 +311,11 @@ final class CameraPulseMonitor: ObservableObject {
     private var colourOffsets = [RGBValue.zero, RGBValue.zero, RGBValue.zero]
     private var greenBaseline: Double?
     private var configuredDeviceID = ""
+    private var acceptedMeasurementDuration = 0.0
+    private var lastAcceptedFrameTime: Double?
+    private var finalResultConfirmed = false
+    private var finalRespiratoryEvaluated = false
+    private var respiratoryConfirmationStarted: Double?
 
     init() {
         processor.onResult = { [weak self] result in
@@ -407,6 +434,20 @@ final class CameraPulseMonitor: ObservableObject {
         }
         session.addInput(input)
 
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            if device.activeFormat.videoSupportedFrameRateRanges.contains(where: {
+                $0.minFrameRate <= 30 && $0.maxFrameRate >= 30
+            }) {
+                let frameDuration = CMTime(value: 1, timescale: 30)
+                device.activeVideoMinFrameDuration = frameDuration
+                device.activeVideoMaxFrameDuration = frameDuration
+            }
+        } catch {
+            // Continue with the camera's default rate if it cannot be configured.
+        }
+
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true
         output.videoSettings = [
@@ -439,8 +480,8 @@ final class CameraPulseMonitor: ObservableObject {
 
     private func resetSignal(keepBPM: Bool = false) {
         regionSamples = [[], [], []]
+        recordingRegionSamples = [[], [], []]
         respirationSamples = [[], [], []]
-        respirationCandidates.removeAll()
         candidates.removeAll()
         pendingJump.removeAll()
         lastEstimateTime = 0
@@ -451,6 +492,14 @@ final class CameraPulseMonitor: ObservableObject {
         pauseUntil = 0
         colourOffsets = [RGBValue.zero, RGBValue.zero, RGBValue.zero]
         calibrationRemaining = Int(Self.initialCalibrationSeconds)
+        measurementSeconds = 0
+        measurementComplete = false
+        signalQuality = nil
+        acceptedMeasurementDuration = 0
+        lastAcceptedFrameTime = nil
+        finalResultConfirmed = false
+        finalRespiratoryEvaluated = false
+        respiratoryConfirmationStarted = nil
         greenWaveform.removeAll()
         greenBaseline = nil
         bodyRegions = []
@@ -463,6 +512,7 @@ final class CameraPulseMonitor: ObservableObject {
         videoFrameSize = result.frameSize
 
         guard let detectedFace = result.faceBox, result.regions.count == 3 else {
+            lastAcceptedFrameTime = nil
             faceBox = nil
             pauseStarted = pauseStarted ?? result.timestamp
             if faceLastSeen > 0, result.timestamp - faceLastSeen > 5 {
@@ -480,6 +530,7 @@ final class CameraPulseMonitor: ObservableObject {
             && detectedFace.height >= 0.30
             && detectedFace.height <= 0.82
         guard !isFrontCamera || (centred && suitableSize) else {
+            lastAcceptedFrameTime = nil
             faceBox = nil
             pauseStarted = pauseStarted ?? result.timestamp
             status = "Paused — centre your face inside the guide"
@@ -511,6 +562,7 @@ final class CameraPulseMonitor: ObservableObject {
             $0 + ($1.red + $1.green + $1.blue) / 3
         } / Double(result.regions.count)
         guard brightness >= 40, brightness <= 235 else {
+            lastAcceptedFrameTime = nil
             pauseStarted = pauseStarted ?? result.timestamp
             status = brightness < 40
                 ? "Paused — more light needed; progress is saved"
@@ -518,6 +570,7 @@ final class CameraPulseMonitor: ObservableObject {
             return
         }
         guard result.timestamp >= pauseUntil else {
+            lastAcceptedFrameTime = nil
             pauseStarted = pauseStarted ?? result.timestamp
             status = "Paused — movement detected; progress is saved"
             return
@@ -526,6 +579,9 @@ final class CameraPulseMonitor: ObservableObject {
         if let pauseStart = pauseStarted {
             let duration = result.timestamp - pauseStart
             regionSamples = regionSamples.map { region in
+                region.map { TimedSample(time: $0.time + duration, rgb: $0.rgb) }
+            }
+            recordingRegionSamples = recordingRegionSamples.map { region in
                 region.map { TimedSample(time: $0.time + duration, rgb: $0.rgb) }
             }
             respirationSamples = respirationSamples.map { region in
@@ -542,6 +598,16 @@ final class CameraPulseMonitor: ObservableObject {
             pauseStarted = nil
         }
 
+        if let previousTime = lastAcceptedFrameTime {
+            let frameDuration = result.timestamp - previousTime
+            if frameDuration > 0, frameDuration < 0.5 {
+                acceptedMeasurementDuration += frameDuration
+            }
+        }
+        lastAcceptedFrameTime = result.timestamp
+        measurementSeconds = min(Int(Self.finalMeasurementSeconds), Int(acceptedMeasurementDuration.rounded(.down)))
+        measurementComplete = acceptedMeasurementDuration >= Self.finalMeasurementSeconds - 0.5
+
         let corrected = result.regions.enumerated().map { index, colour in
             RGBValue(
                 red: colour.red + colourOffsets[index].red,
@@ -554,6 +620,10 @@ final class CameraPulseMonitor: ObservableObject {
             regionSamples[index].removeAll {
                 result.timestamp - $0.time > Self.analysisWindowSeconds + 0.5
             }
+            recordingRegionSamples[index].append(TimedSample(time: result.timestamp, rgb: corrected[index]))
+            recordingRegionSamples[index].removeAll {
+                result.timestamp - $0.time > Self.finalMeasurementSeconds + 0.5
+            }
         }
         bodyRegions = result.bodyRegions
         if result.bodyRegions.isEmpty {
@@ -561,13 +631,12 @@ final class CameraPulseMonitor: ObservableObject {
         } else if let motion = result.bodyMotion, motion.count == 3 {
             if lastBodyMotionTime > 0, result.timestamp - lastBodyMotionTime > 2 {
                 respirationSamples = [[], [], []]
-                respirationCandidates.removeAll()
                 respiratoryRate = nil
             }
             lastBodyMotionTime = result.timestamp
             for index in motion.indices {
                 respirationSamples[index].append(TimedMotionSample(time: result.timestamp, value: motion[index]))
-                respirationSamples[index].removeAll { result.timestamp - $0.time > 40.5 }
+                respirationSamples[index].removeAll { result.timestamp - $0.time > 60.5 }
             }
         }
         updateGreenWaveform(result.regions)
@@ -583,26 +652,46 @@ final class CameraPulseMonitor: ObservableObject {
         guard result.timestamp - lastEstimateTime >= 1 else { return }
         lastEstimateTime = result.timestamp
 
-        let breathingEstimates = respirationSamples.compactMap(Self.estimateRespiratoryRate)
-        if let breathing = Self.respiratoryConsensus(breathingEstimates) {
-            respirationCandidates.append(breathing.rate)
-            respirationCandidates = Array(respirationCandidates.suffix(5))
-            let recentBreathing = Array(respirationCandidates.suffix(3))
-            if recentBreathing.count == 3,
-               (recentBreathing.max()! - recentBreathing.min()!) <= 3 {
-                respiratoryRate = Self.median(recentBreathing)
-                respirationStatus = "Live breathing estimate from upper-body movement"
-            } else {
-                respirationStatus = "Confirming breathing movement… keep your upper body still"
-            }
-        } else if !result.bodyRegions.isEmpty {
+        if !measurementComplete, !finalRespiratoryEvaluated, !result.bodyRegions.isEmpty {
             let breathingDuration = respirationSamples.map { region in
                 guard let first = region.first, let last = region.last else { return 0.0 }
                 return last.time - first.time
             }.max() ?? 0
             respirationStatus = breathingDuration < 25
                 ? "Building breathing signal… \(max(1, Int(ceil(25 - breathingDuration)))) seconds"
-                : "Breathing signal unclear — keep shoulders visible and avoid talking"
+                : "Tracking breathing movement · keep your upper body still"
+        }
+
+        if measurementComplete {
+            if !finalRespiratoryEvaluated {
+                respiratoryConfirmationStarted = respiratoryConfirmationStarted ?? result.timestamp
+                if let breathing = Self.estimateFinalRespiratoryRate(respirationSamples) {
+                    finalRespiratoryEvaluated = true
+                    respiratoryRate = breathing.bpm
+                    respirationStatus = "Breathing rate confirmed from agreeing chest regions"
+                } else if result.timestamp - (respiratoryConfirmationStarted ?? result.timestamp) >= 12 {
+                    finalRespiratoryEvaluated = true
+                    respiratoryRate = nil
+                    respirationStatus = "Unable to confirm breathing rate from this recording"
+                } else {
+                    respirationStatus = "Pulse complete · keep still while breathing rate is confirmed"
+                }
+            }
+            if finalResultConfirmed {
+                status = "Pulse confirmed from the full recording"
+                return
+            }
+            guard let finalEstimate = Self.estimateFinalBPM(recordingRegionSamples) else {
+                signalQuality = nil
+                status = "60 seconds recorded · hold still while the final result is confirmed"
+                return
+            }
+            bpm = finalEstimate.bpm
+            signalQuality = finalEstimate.quality
+            pendingJump.removeAll()
+            finalResultConfirmed = true
+            status = "Pulse confirmed from the full recording"
+            return
         }
 
         let estimates = regionSamples.compactMap(Self.estimateBPM)
@@ -623,6 +712,7 @@ final class CameraPulseMonitor: ObservableObject {
             source = "clearest skin region"
         }
         guard let estimate else {
+            signalQuality = nil
             status = "Signal weak — face steady front lighting"
             return
         }
@@ -650,7 +740,10 @@ final class CameraPulseMonitor: ObservableObject {
         }
 
         bpm = bpm.map { 0.85 * $0 + 0.15 * stable } ?? stable
-        status = source == "regions" ? "Live pulse estimate" : "Live estimate · (source)"
+        signalQuality = estimate.quality
+        status = measurementComplete
+            ? "Measurement complete · ready to save"
+            : source == "regions" ? "Pulse found · keep still for the final result" : "Pulse found · \(source)"
     }
 
     private func updateGreenWaveform(_ colours: [RGBValue]) {
@@ -732,6 +825,42 @@ final class CameraPulseMonitor: ObservableObject {
         return (strongest.bpm, strongest.quality)
     }
 
+    private static func estimateFinalRespiratoryRate(_ regions: [[TimedMotionSample]]) -> Estimate? {
+        let firstTimes = regions.compactMap { $0.first?.time }
+        let lastTimes = regions.compactMap { $0.last?.time }
+        guard regions.count == 3,
+              let first = firstTimes.max(),
+              let last = lastTimes.min(),
+              last - first >= 42
+        else { return nil }
+
+        var estimates = [Estimate]()
+        var start = first
+        while start + 25 <= last + 0.25 {
+            let end = start + 25
+            let regional = regions.compactMap { samples in
+                estimateRespiratoryRate(samples.filter { $0.time >= start && $0.time <= end })
+            }
+            if regional.count >= 2,
+               let agreed = respiratoryConsensus(regional),
+               agreed.quality >= 0.20 {
+                estimates.append(Estimate(bpm: agreed.rate, quality: agreed.quality))
+            }
+            start += 8
+        }
+
+        guard estimates.count >= 3 else { return nil }
+        let centre = median(estimates.map(\.bpm))
+        let inliers = estimates.filter { abs($0.bpm - centre) <= 3 }
+        guard inliers.count >= 3 else { return nil }
+        let rates = inliers.map(\.bpm)
+        guard let minimum = rates.min(), let maximum = rates.max(), maximum - minimum <= 4 else {
+            return nil
+        }
+        let quality = inliers.map(\.quality).reduce(0, +) / Double(inliers.count)
+        return Estimate(bpm: median(rates), quality: quality)
+    }
+
     private static func regionConsensus(_ estimates: [Estimate]) -> Estimate? {
         var pairs = [(Estimate, Estimate)]()
         for first in estimates.indices {
@@ -751,6 +880,50 @@ final class CameraPulseMonitor: ObservableObject {
                 (firstWeight + secondWeight),
             quality: (pair.0.quality + pair.1.quality) / 2
         )
+    }
+
+    // Build the saved result from overlapping windows across the complete
+    // accepted recording, rather than allowing one short section to decide it.
+    private static func estimateFinalBPM(_ regions: [[TimedSample]]) -> Estimate? {
+        let firstTimes = regions.compactMap { $0.first?.time }
+        let lastTimes = regions.compactMap { $0.last?.time }
+        guard regions.count == 3,
+              let first = firstTimes.max(),
+              let last = lastTimes.min(),
+              last - first >= 45
+        else { return nil }
+
+        var windowEstimates = [Estimate]()
+        var start = first
+        while start + analysisWindowSeconds <= last + 0.25 {
+            let end = start + analysisWindowSeconds
+            let windows = regions.map { region in
+                region.filter { $0.time >= start && $0.time <= end }
+            }
+            let regional = windows.compactMap { estimateBPM($0) }.filter { $0.quality >= 0.18 }
+            var estimate = regionConsensus(regional)
+            if estimate == nil,
+               let combinedEstimate = estimateBPM(combine(windows)),
+               combinedEstimate.quality >= 0.22 {
+                estimate = combinedEstimate
+            }
+            if let estimate, estimate.quality >= 0.30 { windowEstimates.append(estimate) }
+            start += 10
+        }
+
+        guard windowEstimates.count >= 3 else { return nil }
+        let centre = median(windowEstimates.map(\.bpm))
+        let inliers = windowEstimates.filter { abs($0.bpm - centre) <= 6 }
+        guard inliers.count >= 3 else { return nil }
+        let rates = inliers.map(\.bpm)
+        guard let minimum = rates.min(), let maximum = rates.max(), maximum - minimum <= 8 else {
+            return nil
+        }
+        let meanQuality = inliers.map(\.quality).reduce(0, +) / Double(inliers.count)
+        let consistency = max(0, 1 - (maximum - minimum) / 12)
+        let quality = meanQuality * (0.65 + 0.35 * consistency)
+        guard quality >= 0.30 else { return nil }
+        return Estimate(bpm: median(rates), quality: quality)
     }
 
     private static func estimateBPM(_ samples: [TimedSample]) -> Estimate? {

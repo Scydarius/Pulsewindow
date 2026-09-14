@@ -15,6 +15,7 @@ export async function generateMetadata(): Promise<Metadata> {
     title,
     description,
     manifest: "/manifest.webmanifest",
+    icons: { icon: "/icon-192.png", apple: "/icon-192.png" },
     appleWebApp: { capable: true, statusBarStyle: "default", title: "Pulse Window" },
     openGraph: { title, description, images: [`${origin}/og.png`] },
     twitter: { card: "summary_large_image", title, description, images: [`${origin}/og.png`] },

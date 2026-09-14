@@ -193,8 +193,13 @@ export default function Home() {
     <main className="portal-page">
       <div className="portal-content">
         <header className="portal-header">
-          <p className="eyebrow">PulseWindow</p>
-          <h1>Doctor portal</h1>
+          <div className="portal-brand">
+            <div className="portal-logo" role="img" aria-label="PulseWindow logo" />
+            <div>
+              <p className="eyebrow">PulseWindow</p>
+              <h1>Doctor portal</h1>
+            </div>
+          </div>
           <p className="intro">
             Issue signed keys to patients and verify that an exported pulse summary hasn&apos;t been altered
             since it left their device.

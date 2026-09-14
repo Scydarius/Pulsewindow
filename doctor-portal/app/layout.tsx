@@ -4,6 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "PulseWindow — Doctor Portal",
   description: "Verify patient-exported PulseWindow medication and monitoring summaries.",
+  icons: { icon: "/pulse-window-logo.png", apple: "/pulse-window-logo.png" },
 };
 
 export const viewport: Viewport = {

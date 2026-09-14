@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { FaceDetector, FilesetResolver } from "@mediapipe/tasks-vision";
+import { FaceDetector, FilesetResolver, PoseLandmarker } from "@mediapipe/tasks-vision";
 import { jsPDF } from "jspdf";
 import JSZip from "jszip";
 import {
@@ -137,7 +137,9 @@ type MedicationPreset = {
 };
 type RGB = [number, number, number];
 type Sample = { time: number; rgb: RGB };
+type MotionSample = { time: number; value: number };
 type FaceBox = { x: number; y: number; width: number; height: number };
+type PosePoint = { x: number; y: number; visibility?: number };
 
 const STORAGE_KEY = "pulse-window-readings";
 const MEDICATIONS_KEY = "pulse-window-medications";
@@ -205,6 +207,7 @@ const MIN_REGION_QUALITY = 0.18;
 const MIN_COMBINED_QUALITY = 0.22;
 const INITIAL_CALIBRATION_SECONDS = 15;
 const SIGNAL_WINDOW_SECONDS = 20;
+const FINAL_MEASUREMENT_SECONDS = 60;
 const REGION_AGREEMENT_BPM = 10;
 
 // Breathing is much slower than heart rate (roughly 0.1-0.5 Hz vs 0.75-3 Hz),
@@ -212,7 +215,7 @@ const REGION_AGREEMENT_BPM = 10;
 const MIN_RESPIRATION_RATE = 6;
 const MAX_RESPIRATION_RATE = 30;
 const RESPIRATION_WINDOW_SECONDS = 60;
-const MIN_RESPIRATION_QUALITY = 0.25;
+const MIN_RESPIRATION_QUALITY = 0.20;
 
 // Set VITE_DEV_MODE=true when starting the dev server to enable developer-only
 // tools (e.g. simulating a BPM reading without a camera). Off by default so it
@@ -272,22 +275,6 @@ function formatDateTimeForFilename(date: Date): string {
     `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
     `_${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`
   );
-}
-
-// Writes one entry into a real directory tree via the File System Access
-// API, creating any intermediate folders (e.g. "DigitalSignature/hash.txt")
-// as needed.
-async function writeExportEntry(root: FileSystemDirectoryHandle, entry: ExportEntry): Promise<void> {
-  const segments = entry.path.split("/");
-  const fileName = segments.pop()!;
-  let directory = root;
-  for (const segment of segments) {
-    directory = await directory.getDirectoryHandle(segment, { create: true });
-  }
-  const fileHandle = await directory.getFileHandle(fileName, { create: true });
-  const writable = await fileHandle.createWritable();
-  await writable.write(entry.data);
-  await writable.close();
 }
 
 function presetForMedicineName(medicineName: string) {
@@ -614,6 +601,49 @@ function agreeAcrossRegions(estimates: PulseEstimate[]) {
   };
 }
 
+// Produce the saved result from several overlapping windows across the full
+// accepted recording. This prevents a single clean (or noisy) 20-second
+// section from determining the final minute-long result.
+function estimateFinalBPM(regionSamples: Sample[][]) {
+  const first = Math.max(...regionSamples.map((samples) => samples[0]?.time ?? Infinity));
+  const last = Math.min(...regionSamples.map((samples) => samples.at(-1)?.time ?? -Infinity));
+  if (!Number.isFinite(first) || !Number.isFinite(last) || last - first < 45) return null;
+
+  const windowSeconds = SIGNAL_WINDOW_SECONDS;
+  const stepSeconds = 10;
+  const estimates: PulseEstimate[] = [];
+  for (let start = first; start + windowSeconds <= last + 0.25; start += stepSeconds) {
+    const windowRegions = regionSamples.map((samples) =>
+      samples.filter((sample) => sample.time >= start && sample.time <= start + windowSeconds)
+    );
+    const regional = windowRegions
+      .map(estimateBPM)
+      .filter((estimate): estimate is PulseEstimate =>
+        estimate !== null && estimate.quality >= MIN_REGION_QUALITY
+      );
+    let estimate = agreeAcrossRegions(regional);
+    if (!estimate) {
+      const combined = estimateBPM(combineRegionSamples(windowRegions));
+      if (combined && combined.quality >= MIN_COMBINED_QUALITY) estimate = combined;
+    }
+    if (estimate && estimate.quality >= MIN_QUALITY) estimates.push(estimate);
+  }
+
+  if (estimates.length < 3) return null;
+  const centre = median(estimates.map((estimate) => estimate.bpm));
+  const inliers = estimates.filter((estimate) => Math.abs(estimate.bpm - centre) <= 6);
+  if (inliers.length < 3) return null;
+  const rates = inliers.map((estimate) => estimate.bpm);
+  const spread = Math.max(...rates) - Math.min(...rates);
+  if (spread > 8) return null;
+  const meanQuality = inliers.reduce((sum, estimate) => sum + estimate.quality, 0) / inliers.length;
+  const consistency = Math.max(0, 1 - spread / 12);
+  const quality = meanQuality * (0.65 + 0.35 * consistency);
+  if (quality < MIN_QUALITY) return null;
+  const latest = inliers.at(-1)!;
+  return { bpm: median(rates), quality, beatAge: latest.beatAge };
+}
+
 // Breathing shows up as a slow-moving component riding on top of the same
 // facial colour signal used for heart rate — a mix of respiratory sinus
 // arrhythmia and respiratory-induced intensity variation. Unlike estimateBPM
@@ -621,30 +651,42 @@ function agreeAcrossRegions(estimates: PulseEstimate[]) {
 // band), this tracks the green channel directly — it's the most
 // PPG-sensitive channel — over a much longer window, linearly detrends it,
 // and searches for the dominant frequency in the breathing band.
-function estimateRespiratoryRate(samples: Sample[]) {
+function estimateRespiratoryRate(samples: MotionSample[]) {
   if (
-    samples.length < 200 ||
-    samples.at(-1)!.time - samples[0].time < RESPIRATION_WINDOW_SECONDS * 0.66
+    samples.length < 120 ||
+    samples.at(-1)!.time - samples[0].time < 25
   ) {
     return null;
   }
 
-  const fps = 6;
-  const colours = interpolateSamples(samples, fps);
-  if (colours.length < 60) return null;
+  const fps = 10;
+  const first = samples[0];
+  const last = samples.at(-1)!;
+  const count = Math.floor((last.time - first.time) * fps);
+  const values: number[] = [];
+  let source = 0;
+  for (let index = 0; index < count; index += 1) {
+    const time = first.time + index / fps;
+    while (source + 1 < samples.length && samples[source + 1].time < time) source += 1;
+    if (source + 1 >= samples.length) break;
+    const a = samples[source];
+    const b = samples[source + 1];
+    const fraction = (time - a.time) / Math.max(b.time - a.time, 1e-6);
+    values.push(a.value + (b.value - a.value) * fraction);
+  }
+  if (values.length < 250) return null;
 
-  const green = colours.map((colour) => colour[1]);
-  const meanIndex = (green.length - 1) / 2;
-  const meanValue = green.reduce((sum, value) => sum + value, 0) / green.length;
+  const meanIndex = (values.length - 1) / 2;
+  const meanValue = values.reduce((sum, value) => sum + value, 0) / values.length;
   let sumSquaredOffsets = 0;
   let sumOffsetDeviation = 0;
-  green.forEach((value, index) => {
+  values.forEach((value, index) => {
     const offset = index - meanIndex;
     sumSquaredOffsets += offset * offset;
     sumOffsetDeviation += offset * (value - meanValue);
   });
   const slope = sumSquaredOffsets > 0 ? sumOffsetDeviation / sumSquaredOffsets : 0;
-  const detrended = green.map((value, index) => value - meanValue - slope * (index - meanIndex));
+  const detrended = values.map((value, index) => value - meanValue - slope * (index - meanIndex));
 
   const powers: { rate: number; power: number }[] = [];
   for (let rate = MIN_RESPIRATION_RATE; rate <= MAX_RESPIRATION_RATE; rate += 0.5) {
@@ -666,6 +708,113 @@ function estimateRespiratoryRate(samples: Sample[]) {
     .filter((item) => Math.abs(item.rate - peak.rate) <= 2)
     .reduce((sum, item) => sum + item.power, 0);
   return { rate: peak.rate, quality: total > 0 ? local / total : 0 };
+}
+
+function respiratoryConsensus(estimates: { rate: number; quality: number }[]) {
+  const pairs: Array<[{ rate: number; quality: number }, { rate: number; quality: number }]> = [];
+  for (let first = 0; first < estimates.length; first += 1) {
+    for (let second = first + 1; second < estimates.length; second += 1) {
+      if (Math.abs(estimates[first].rate - estimates[second].rate) <= 3) {
+        pairs.push([estimates[first], estimates[second]]);
+      }
+    }
+  }
+  const pair = pairs.sort((a, b) =>
+    b[0].quality + b[1].quality - a[0].quality - a[1].quality
+  )[0];
+  if (!pair) return null;
+  const quality = (pair[0].quality + pair[1].quality) / 2;
+  const rate = (pair[0].rate * pair[0].quality + pair[1].rate * pair[1].quality) /
+    Math.max(pair[0].quality + pair[1].quality, 1e-6);
+  return { rate, quality };
+}
+
+function estimateFinalRespiratoryRate(regionSamples: MotionSample[][]) {
+  const first = Math.max(...regionSamples.map((samples) => samples[0]?.time ?? Infinity));
+  const last = Math.min(...regionSamples.map((samples) => samples.at(-1)?.time ?? -Infinity));
+  if (!Number.isFinite(first) || !Number.isFinite(last) || last - first < 42) return null;
+
+  const estimates: { rate: number; quality: number }[] = [];
+  for (let start = first; start + 25 <= last + 0.25; start += 8) {
+    const regional = regionSamples
+      .map((samples) => estimateRespiratoryRate(
+        samples.filter((sample) => sample.time >= start && sample.time <= start + 25)
+      ))
+      .filter((estimate): estimate is { rate: number; quality: number } =>
+        estimate !== null && estimate.quality >= 0.14
+      );
+    const agreed = respiratoryConsensus(regional);
+    if (agreed && agreed.quality >= MIN_RESPIRATION_QUALITY) estimates.push(agreed);
+  }
+  if (estimates.length < 3) return null;
+  const centre = median(estimates.map((estimate) => estimate.rate));
+  const inliers = estimates.filter((estimate) => Math.abs(estimate.rate - centre) <= 3);
+  if (inliers.length < 3) return null;
+  const rates = inliers.map((estimate) => estimate.rate);
+  if (Math.max(...rates) - Math.min(...rates) > 4) return null;
+  return {
+    rate: median(rates),
+    quality: inliers.reduce((sum, estimate) => sum + estimate.quality, 0) / inliers.length,
+  };
+}
+
+function chestRegionsFromPose(landmarks: PosePoint[], width: number, height: number): FaceBox[] | null {
+  const left = landmarks[11];
+  const right = landmarks[12];
+  if (!left || !right || (left.visibility ?? 1) < 0.55 || (right.visibility ?? 1) < 0.55) return null;
+  const leftX = left.x * width;
+  const rightX = right.x * width;
+  const shoulderY = ((left.y + right.y) / 2) * height;
+  const span = Math.abs(rightX - leftX);
+  if (span < width * 0.16 || shoulderY > height * 0.72) return null;
+  const minX = Math.min(leftX, rightX);
+  const regionHeight = Math.min(span * 0.42, height - shoulderY - 2);
+  if (regionHeight < height * 0.08) return null;
+  const raw = [
+    { x: minX + span * 0.18, y: shoulderY + span * 0.06, width: span * 0.64, height: regionHeight },
+    { x: minX - span * 0.04, y: shoulderY + span * 0.03, width: span * 0.38, height: regionHeight * 0.72 },
+    { x: minX + span * 0.66, y: shoulderY + span * 0.03, width: span * 0.38, height: regionHeight * 0.72 },
+  ];
+  return raw.map((region) => ({
+    x: Math.max(0, region.x),
+    y: Math.max(0, region.y),
+    width: Math.min(width - Math.max(0, region.x), region.width),
+    height: Math.min(height - Math.max(0, region.y), region.height),
+  }));
+}
+
+const MOTION_GRID_SIZE = 20;
+function motionGrid(context: CanvasRenderingContext2D, region: FaceBox) {
+  const image = context.getImageData(
+    Math.floor(region.x), Math.floor(region.y),
+    Math.max(1, Math.floor(region.width)), Math.max(1, Math.floor(region.height)),
+  );
+  const values: number[] = [];
+  for (let gridY = 0; gridY < MOTION_GRID_SIZE; gridY += 1) {
+    for (let gridX = 0; gridX < MOTION_GRID_SIZE; gridX += 1) {
+      const x = Math.min(image.width - 1, Math.floor((gridX + 0.5) * image.width / MOTION_GRID_SIZE));
+      const y = Math.min(image.height - 1, Math.floor((gridY + 0.5) * image.height / MOTION_GRID_SIZE));
+      const offset = (y * image.width + x) * 4;
+      values.push(0.299 * image.data[offset] + 0.587 * image.data[offset + 1] + 0.114 * image.data[offset + 2]);
+    }
+  }
+  return values;
+}
+
+function verticalMotion(previous: number[], current: number[]) {
+  if (previous.length !== current.length) return null;
+  let numerator = 0;
+  let denominator = 0;
+  for (let y = 1; y < MOTION_GRID_SIZE - 1; y += 1) {
+    for (let x = 1; x < MOTION_GRID_SIZE - 1; x += 1) {
+      const index = y * MOTION_GRID_SIZE + x;
+      const gradient = (current[index + MOTION_GRID_SIZE] - current[index - MOTION_GRID_SIZE]) / 2;
+      numerator += gradient * (current[index] - previous[index]);
+      denominator += gradient * gradient;
+    }
+  }
+  if (denominator < 700) return null;
+  return Math.max(-1.5, Math.min(1.5, -numerator / denominator));
 }
 
 function faceRegions(face: FaceBox) {
@@ -967,14 +1116,19 @@ export default function Home() {
   const [monitoring, setMonitoring] = useState(false);
   const [bpm, setBpm] = useState<number | null>(null);
   const [respiratoryRate, setRespiratoryRate] = useState<number | null>(null);
+  const [respirationStatus, setRespirationStatus] = useState("Show your shoulders and upper chest");
   const [status, setStatus] = useState("Ready to measure");
   const [calibrationSeconds, setCalibrationSeconds] = useState<number | null>(null);
+  const [measurementSeconds, setMeasurementSeconds] = useState(0);
+  const [measurementComplete, setMeasurementComplete] = useState(false);
+  const [signalQuality, setSignalQuality] = useState<number | null>(null);
   const [beatSync, setBeatSync] = useState({ age: 0, revision: 0 });
   const [developerMode, setDeveloperMode] = useState(false);
   const [simulatedBpmInput, setSimulatedBpmInput] = useState("");
   const [simulatedRespiratoryInput, setSimulatedRespiratoryInput] = useState("");
   const [devTimeOffsetInput, setDevTimeOffsetInput] = useState("0");
   const [faceBox, setFaceBox] = useState<FaceBox | null>(null);
+  const [bodyRegions, setBodyRegions] = useState<FaceBox[]>([]);
   const [readings, setReadings] = useState<Reading[]>([]);
   const [medications, setMedications] = useState<Medication[]>([]);
   const [doses, setDoses] = useState<DoseEvent[]>([]);
@@ -1020,7 +1174,14 @@ export default function Home() {
   const streamRef = useRef<MediaStream | null>(null);
   const animationRef = useRef<number | null>(null);
   const regionSamplesRef = useRef<Sample[][]>([[], [], []]);
+  const recordingRegionSamplesRef = useRef<Sample[][]>([[], [], []]);
+  const finalResultConfirmedRef = useRef(false);
   const respiratorySamplesRef = useRef<Sample[]>([]);
+  const respiratoryMotionSamplesRef = useRef<MotionSample[][]>([[], [], []]);
+  const previousMotionGridsRef = useRef<(number[] | null)[]>([null, null, null]);
+  const cumulativeMotionRef = useRef([0, 0, 0]);
+  const finalRespiratoryEvaluatedRef = useRef(false);
+  const respiratoryConfirmationStartedRef = useRef<number | null>(null);
   const candidatesRef = useRef<number[]>([]);
   const pendingJumpRef = useRef<number[]>([]);
   const lastEstimateRef = useRef(0);
@@ -1029,7 +1190,10 @@ export default function Home() {
   const developerModeRef = useRef(false);
   const greenBaselineRef = useRef<Float32Array | null>(null);
   const faceDetectorRef = useRef<FaceDetector | null>(null);
+  const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
   const faceBoxRef = useRef<FaceBox | null>(null);
+  const bodyRegionsRef = useRef<FaceBox[]>([]);
+  const bodyLastSeenRef = useRef(0);
   const lastFaceDetectionRef = useRef(0);
   const faceLastSeenRef = useRef(0);
   const unstableUntilRef = useRef(0);
@@ -1051,6 +1215,24 @@ export default function Home() {
     });
     faceDetectorRef.current = detector;
     return detector;
+  }, []);
+
+  const loadPoseLandmarker = useCallback(async () => {
+    if (poseLandmarkerRef.current) return poseLandmarkerRef.current;
+    const vision = await FilesetResolver.forVisionTasks("/mediapipe");
+    const landmarker = await PoseLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath:
+          "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+        delegate: "GPU",
+      },
+      runningMode: "VIDEO",
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+    poseLandmarkerRef.current = landmarker;
+    return landmarker;
   }, []);
 
   useEffect(() => {
@@ -1236,9 +1418,17 @@ export default function Home() {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
     faceBoxRef.current = null;
+    bodyRegionsRef.current = [];
     greenBaselineRef.current = null;
     regionSamplesRef.current = [[], [], []];
+    recordingRegionSamplesRef.current = [[], [], []];
+    finalResultConfirmedRef.current = false;
     respiratorySamplesRef.current = [];
+    respiratoryMotionSamplesRef.current = [[], [], []];
+    previousMotionGridsRef.current = [null, null, null];
+    cumulativeMotionRef.current = [0, 0, 0];
+    finalRespiratoryEvaluatedRef.current = false;
+    respiratoryConfirmationStartedRef.current = null;
     respiratoryRateRef.current = null;
     candidatesRef.current = [];
     pendingJumpRef.current = [];
@@ -1247,9 +1437,12 @@ export default function Home() {
     pauseStartedRef.current = null;
     sampleOffsetsRef.current = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
     setFaceBox(null);
+    setBodyRegions([]);
     setCalibrationSeconds(null);
     setMonitoring(false);
     setRespiratoryRate(null);
+    setRespirationStatus("Show your shoulders and upper chest");
+    setSignalQuality(null);
     setStatus("Monitoring stopped");
   }, []);
 
@@ -1280,8 +1473,12 @@ export default function Home() {
     setBpm(value);
     respiratoryRateRef.current = respiratoryValue;
     setRespiratoryRate(respiratoryValue);
+    setRespirationStatus(respiratoryValue === null ? "No simulated breathing value" : "Simulated experimental value");
     setMonitoring(true);
     setCalibrationSeconds(null);
+    setMeasurementSeconds(FINAL_MEASUREMENT_SECONDS);
+    setMeasurementComplete(true);
+    setSignalQuality(0.8);
     setBeatSync((current) => ({ age: 0, revision: current.revision + 1 }));
     setStatus("Simulated reading — not from camera");
   };
@@ -1354,11 +1551,38 @@ export default function Home() {
         if (pauseStartedRef.current === null) pauseStartedRef.current = nowMs;
         if (nowMs - faceLastSeenRef.current > 5000) {
           regionSamplesRef.current = [[], [], []];
+          recordingRegionSamplesRef.current = [[], [], []];
           respiratorySamplesRef.current = [];
           candidatesRef.current = [];
           pendingJumpRef.current = [];
           sampleOffsetsRef.current = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+          finalResultConfirmedRef.current = false;
+          setMeasurementSeconds(0);
+          setMeasurementComplete(false);
+          setSignalQuality(null);
           setCalibrationSeconds(null);
+        }
+      }
+
+      if (poseLandmarkerRef.current) {
+        const pose = poseLandmarkerRef.current.detectForVideo(video, nowMs).landmarks[0];
+        const detectedRegions = pose ? chestRegionsFromPose(pose, canvas.width, canvas.height) : null;
+        if (detectedRegions) {
+          const previous = bodyRegionsRef.current;
+          bodyRegionsRef.current = previous.length === 3
+            ? detectedRegions.map((region, index) => ({
+                x: previous[index].x + (region.x - previous[index].x) * 0.16,
+                y: previous[index].y + (region.y - previous[index].y) * 0.16,
+                width: previous[index].width + (region.width - previous[index].width) * 0.16,
+                height: previous[index].height + (region.height - previous[index].height) * 0.16,
+              }))
+            : detectedRegions;
+          setBodyRegions(bodyRegionsRef.current);
+          bodyLastSeenRef.current = nowMs;
+        } else if (nowMs - bodyLastSeenRef.current > 900) {
+          bodyRegionsRef.current = [];
+          setBodyRegions([]);
+          previousMotionGridsRef.current = [null, null, null];
         }
       }
     }
@@ -1413,10 +1637,16 @@ export default function Home() {
         regionSamplesRef.current = regionSamplesRef.current.map((samples) =>
           samples.map((sample) => ({ ...sample, time: sample.time + pauseSeconds }))
         );
+        recordingRegionSamplesRef.current = recordingRegionSamplesRef.current.map((samples) =>
+          samples.map((sample) => ({ ...sample, time: sample.time + pauseSeconds }))
+        );
         respiratorySamplesRef.current = respiratorySamplesRef.current.map((sample) => ({
           ...sample,
           time: sample.time + pauseSeconds,
         }));
+        respiratoryMotionSamplesRef.current = respiratoryMotionSamplesRef.current.map((samples) =>
+          samples.map((sample) => ({ ...sample, time: sample.time + pauseSeconds }))
+        );
         sampleOffsetsRef.current = regionColours.map((rgb, index) => {
           const previous = regionSamplesRef.current[index].at(-1)?.rgb;
           return previous
@@ -1434,6 +1664,10 @@ export default function Home() {
         ...samples,
         { time: now, rgb: correctedColours[index] },
       ].filter((sample) => now - sample.time <= SIGNAL_WINDOW_SECONDS + 0.5));
+      recordingRegionSamplesRef.current = recordingRegionSamplesRef.current.map((samples, index) => [
+        ...samples,
+        { time: now, rgb: correctedColours[index] },
+      ].filter((sample) => now - sample.time <= FINAL_MEASUREMENT_SECONDS + 0.5));
       const combinedForRespiratory: RGB = [0, 1, 2].map((channel) =>
         median(correctedColours.map((colour) => colour[channel])),
       ) as RGB;
@@ -1441,6 +1675,41 @@ export default function Home() {
         ...respiratorySamplesRef.current,
         { time: now, rgb: combinedForRespiratory },
       ].filter((sample) => now - sample.time <= RESPIRATION_WINDOW_SECONDS + 0.5);
+      const trackedBodyRegions = bodyRegionsRef.current;
+      if (trackedBodyRegions.length === 3) {
+        const currentGrids = trackedBodyRegions.map((region) => motionGrid(context, region));
+        let producedMotion = false;
+        currentGrids.forEach((grid, index) => {
+          const previous = previousMotionGridsRef.current[index];
+          const motion = previous ? verticalMotion(previous, grid) : null;
+          if (motion !== null) {
+            cumulativeMotionRef.current[index] += motion;
+            respiratoryMotionSamplesRef.current[index].push({
+              time: now,
+              value: cumulativeMotionRef.current[index],
+            });
+            respiratoryMotionSamplesRef.current[index] = respiratoryMotionSamplesRef.current[index]
+              .filter((sample) => now - sample.time <= RESPIRATION_WINDOW_SECONDS + 0.5);
+            producedMotion = true;
+          }
+          previousMotionGridsRef.current[index] = grid;
+        });
+        if (!finalRespiratoryEvaluatedRef.current) {
+          setRespirationStatus(producedMotion
+            ? "Tracking breathing movement · keep your upper body still"
+            : "Hold still while the breathing signal builds");
+        }
+      } else {
+        previousMotionGridsRef.current = [null, null, null];
+        if (!finalRespiratoryEvaluatedRef.current) {
+          setRespirationStatus("Move back until both shoulders and your upper chest are visible");
+        }
+      }
+      const firstMeasurementSample = respiratorySamplesRef.current[0];
+      const acceptedDuration = firstMeasurementSample ? now - firstMeasurementSample.time : 0;
+      const completedNow = acceptedDuration >= FINAL_MEASUREMENT_SECONDS - 0.5;
+      setMeasurementSeconds(Math.min(FINAL_MEASUREMENT_SECONDS, Math.floor(acceptedDuration)));
+      if (completedNow) setMeasurementComplete(true);
       const duration = now - regionSamplesRef.current[0][0].time;
       if (duration < INITIAL_CALIBRATION_SECONDS - 0.5) {
         const remaining = Math.max(1, Math.ceil(INITIAL_CALIBRATION_SECONDS - duration));
@@ -1451,12 +1720,50 @@ export default function Home() {
         setCalibrationSeconds(null);
         lastEstimateRef.current = now;
 
-        const respiratory = estimateRespiratoryRate(respiratorySamplesRef.current);
-        if (respiratory && respiratory.quality >= MIN_RESPIRATION_QUALITY) {
-          const current = respiratoryRateRef.current;
-          const smoothed = current === null ? respiratory.rate : 0.8 * current + 0.2 * respiratory.rate;
-          respiratoryRateRef.current = smoothed;
-          setRespiratoryRate(smoothed);
+        if (completedNow && !finalRespiratoryEvaluatedRef.current) {
+          respiratoryConfirmationStartedRef.current ??= now;
+          const respiratory = estimateFinalRespiratoryRate(respiratoryMotionSamplesRef.current);
+          if (respiratory) {
+            finalRespiratoryEvaluatedRef.current = true;
+            respiratoryRateRef.current = respiratory.rate;
+            setRespiratoryRate(respiratory.rate);
+            setRespirationStatus("Breathing rate confirmed from agreeing chest regions");
+          } else if (now - respiratoryConfirmationStartedRef.current >= 12) {
+            finalRespiratoryEvaluatedRef.current = true;
+            respiratoryRateRef.current = null;
+            setRespiratoryRate(null);
+            setRespirationStatus("Unable to confirm breathing rate from this recording");
+          } else {
+            setRespirationStatus("Pulse complete · keep still while breathing rate is confirmed");
+          }
+        }
+
+        if (completedNow && finalResultConfirmedRef.current) {
+          setStatus("Pulse confirmed from the full recording");
+          animationRef.current = requestAnimationFrame(frameAnalysis);
+          return;
+        }
+        const finalEstimate = completedNow
+          ? estimateFinalBPM(recordingRegionSamplesRef.current)
+          : null;
+        if (completedNow && finalEstimate) {
+          bpmRef.current = finalEstimate.bpm;
+          setBpm(finalEstimate.bpm);
+          setSignalQuality(finalEstimate.quality);
+          finalResultConfirmedRef.current = true;
+          setBeatSync((currentSync) => ({
+            age: finalEstimate.beatAge,
+            revision: currentSync.revision + 1,
+          }));
+          setStatus("Pulse confirmed from the full recording");
+          animationRef.current = requestAnimationFrame(frameAnalysis);
+          return;
+        }
+        if (completedNow) {
+          setSignalQuality(null);
+          setStatus("60 seconds recorded · hold still while the final result is confirmed");
+          animationRef.current = requestAnimationFrame(frameAnalysis);
+          return;
         }
 
         const regionEstimates = regionSamplesRef.current
@@ -1482,6 +1789,7 @@ export default function Home() {
           }
         }
         if (!estimate) {
+          setSignalQuality(null);
           setStatus("Signal weak — face steady front lighting");
         }
         else {
@@ -1516,17 +1824,18 @@ export default function Home() {
               const displayed = current === null ? stable : 0.85 * current + 0.15 * stable;
               bpmRef.current = displayed;
               setBpm(displayed);
+              setSignalQuality(estimate.quality);
               setBeatSync((currentSync) => ({
                 age: estimate.beatAge,
                 revision: currentSync.revision + 1,
               }));
-              setStatus(
-                estimateSource === "single"
-                  ? "Live reading · clearest region"
+              setStatus(completedNow
+                ? "Measurement complete · ready to save"
+                : estimateSource === "single"
+                  ? "Pulse found · confirming the clearest region"
                   : estimateSource === "combined"
-                    ? "Live reading · combined face signal"
-                    : "Live reading",
-              );
+                    ? "Pulse found · confirming combined face signal"
+                    : "Pulse found · keep still for the final result");
             }
           }
         }
@@ -1539,19 +1848,30 @@ export default function Home() {
     try {
       stopCamera();
       regionSamplesRef.current = [[], [], []];
+      recordingRegionSamplesRef.current = [[], [], []];
+      finalResultConfirmedRef.current = false;
       respiratorySamplesRef.current = [];
+      respiratoryMotionSamplesRef.current = [[], [], []];
+      previousMotionGridsRef.current = [null, null, null];
+      cumulativeMotionRef.current = [0, 0, 0];
+      finalRespiratoryEvaluatedRef.current = false;
+      respiratoryConfirmationStartedRef.current = null;
       candidatesRef.current = [];
       pendingJumpRef.current = [];
       bpmRef.current = null;
       respiratoryRateRef.current = null;
+      setMeasurementSeconds(0);
+      setMeasurementComplete(false);
+      setSignalQuality(null);
       setBpm(null);
       setRespiratoryRate(null);
+      setRespirationStatus("Show your shoulders and upper chest");
       const available = cameras.length ? cameras : await findCameras();
       const deviceId = selectedCamera || available[0]?.deviceId;
       const stream = await navigator.mediaDevices.getUserMedia({
         video: deviceId
-          ? { deviceId: { exact: deviceId }, width: { ideal: 640 }, height: { ideal: 480 } }
-          : { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+          ? { deviceId: { exact: deviceId }, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } }
+          : { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
         audio: false,
       });
       streamRef.current = stream;
@@ -1561,7 +1881,7 @@ export default function Home() {
       }
       setMonitoring(true);
       setStatus("Loading face tracker…");
-      await loadFaceDetector();
+      await Promise.all([loadFaceDetector(), loadPoseLandmarker()]);
       setStatus("Finding your face…");
       animationRef.current = requestAnimationFrame(analyseFrame);
     } catch (error) {
@@ -1578,7 +1898,7 @@ export default function Home() {
               : `Face tracker could not start (${name}).`;
       setStatus(reason);
     }
-  }, [analyseFrame, cameras, findCameras, loadFaceDetector, selectedCamera, stopCamera]);
+  }, [analyseFrame, cameras, findCameras, loadFaceDetector, loadPoseLandmarker, selectedCamera, stopCamera]);
 
   // vitalsActive gates the live-check sub-view of the Log Vitals page. It's a
   // separate flag from `monitoring` so the video element (and, if the camera
@@ -1791,6 +2111,14 @@ export default function Home() {
   const saveReading = () => {
     if (bpm === null) {
       setStatus("Wait for a confirmed measurement before saving");
+      return;
+    }
+    if (!measurementComplete) {
+      setStatus("Keep measuring until the 60-second check is complete");
+      return;
+    }
+    if (signalQuality === null) {
+      setStatus("Hold still until the signal is confirmed before saving");
       return;
     }
     // devTimeOffsetInput only has a UI to change it in dev mode and defaults
@@ -2217,25 +2545,17 @@ export default function Home() {
         );
       }
       const folderName = `PulseWindowReporting-${formatDateTimeForFilename(new Date())}`;
-
-      if (typeof window.showDirectoryPicker === "function") {
-        const parentHandle = await window.showDirectoryPicker({ mode: "readwrite" });
-        const rootHandle = await parentHandle.getDirectoryHandle(folderName, { create: true });
-        for (const entry of entries) {
-          await writeExportEntry(rootHandle, entry);
-        }
-        setPatientNotice(`Saved “${folderName}” to the folder you picked.`);
-      } else {
-        const zip = new JSZip();
-        entries.forEach((entry) => zip.file(entry.path, entry.data));
-        const zipBlob = await zip.generateAsync({ type: "blob" });
-        const link = document.createElement("a");
-        link.href = URL.createObjectURL(zipBlob);
-        link.download = `${folderName}.zip`;
-        link.click();
-        URL.revokeObjectURL(link.href);
-        setPatientNotice("Your browser can't save a folder directly, so this downloaded as a .zip instead.");
-      }
+      const zip = new JSZip();
+      entries.forEach((entry) => zip.file(entry.path, entry.data));
+      const zipBlob = await zip.generateAsync({ type: "blob" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(zipBlob);
+      link.download = `${folderName}.zip`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+      setPatientNotice("The report downloaded as a .zip file to your browser's Downloads folder.");
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
       console.error("Could not export the report", error);
@@ -2267,9 +2587,9 @@ export default function Home() {
         onChange={(_event, next: Screen) => navigate(next)}
         sx={{ height: 74 }}
       >
-        <BottomNavigationAction label="Log Vitals" value="vitals" icon={<MedicalServicesIcon />} />
-        <BottomNavigationAction label="Log Medicine" value="medicine" icon={<MedicationIcon />} />
-        <BottomNavigationAction label="My Data" value="data" icon={<BarChartIcon />} />
+        <BottomNavigationAction label="Today" value="vitals" icon={<MedicalServicesIcon />} />
+        <BottomNavigationAction label="Medicines" value="medicine" icon={<MedicationIcon />} />
+        <BottomNavigationAction label="Records" value="data" icon={<BarChartIcon />} />
       </BottomNavigation>
     </Paper>
   );
@@ -2318,29 +2638,25 @@ export default function Home() {
         </DialogActions>
       </Dialog>
       {screen === "vitals" && !vitalsActive && (
-        <Container maxWidth="sm" sx={{ pt: 4, pb: 14 }} component="section">
+        <Container maxWidth="md" sx={{ pt: { xs: 3, sm: 5 }, pb: 14, px: { xs: 2, sm: 3 } }} component="section">
           <Stack direction="row" spacing={2} sx={{ mb: 3, alignItems: "center" }}>
             <Box
-              aria-hidden="true"
+              component="img"
+              src="/pulse-window-logo.png"
+              alt="Pulse Window logo"
               sx={{
                 width: 64,
                 height: 64,
-                display: "grid",
-                placeItems: "center",
                 borderRadius: 3,
-                fontSize: 34,
-                color: "common.white",
-                bgcolor: "error.main",
+                objectFit: "cover",
                 boxShadow: "0 14px 30px rgba(173, 41, 47, .2)",
               }}
-            >
-              ♥
-            </Box>
+            />
             <Box>
               <Typography variant="overline" color="primary" sx={{ display: "block", fontWeight: 800 }}>
                 Pulse Window
               </Typography>
-              <Typography variant="h4" sx={{ fontWeight: 800, letterSpacing: "-0.03em" }}>Log Vitals</Typography>
+              <Typography variant="h4" sx={{ fontWeight: 800, letterSpacing: "-0.03em" }}>Today</Typography>
               <Typography color="text.secondary" suppressHydrationWarning>
                 {clock.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" })}
               </Typography>
@@ -2399,7 +2715,7 @@ export default function Home() {
             you when closed.
           </Typography>
 
-          <Stack direction="row" spacing={1.5} sx={{ mb: 3 }}>
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={2} sx={{ mb: 4 }}>
             <Card sx={{ flex: 1 }}>
               <CardContent>
                 <Typography sx={{ color: "error.main", fontSize: 22 }}>♥</Typography>
@@ -2441,8 +2757,8 @@ export default function Home() {
                 </Typography>
               )}
               <Typography color="text.secondary" sx={{ mb: 2 }}>
-                Sit still in steady front lighting. Calibration takes 15 seconds, then the app confirms a stable
-                estimate.
+                Sit far enough back to show your face, both shoulders and upper chest. Keep still for the full
+                60-second check so the app can confirm your pulse and attempt an experimental breathing estimate.
               </Typography>
               <Stack direction="row" spacing={1} sx={{ mb: 2 }}>
                 <FormControl fullWidth size="small">
@@ -2461,7 +2777,7 @@ export default function Home() {
                 </FormControl>
                 <Button variant="outlined" onClick={findCameras} sx={{ flexShrink: 0 }}>Identify</Button>
               </Stack>
-              <Button variant="contained" size="large" fullWidth onClick={beginVitalsCheck}>Check vitals</Button>
+              <Button variant="contained" size="large" fullWidth onClick={beginVitalsCheck}>Start 60-second check</Button>
             </CardContent>
           </Card>
 
@@ -2475,9 +2791,9 @@ export default function Home() {
       {screen === "vitals" && vitalsActive && (
         <section className="monitor-screen">
           <Stack direction="row" className="topbar" sx={{ alignItems: "center", justifyContent: "space-between" }}>
-            <Button color="inherit" onClick={leaveVitalsCheck}>← Stop</Button>
-            <Typography sx={{ fontWeight: 800 }}>Checking vitals</Typography>
-            <Button color="inherit" onClick={() => navigate("data")}>My Data</Button>
+            <Button color="inherit" onClick={leaveVitalsCheck}>← Cancel</Button>
+            <Typography sx={{ fontWeight: 800 }}>60-second check</Typography>
+            <Button color="inherit" onClick={() => navigate("data")}>Records</Button>
           </Stack>
 
           <div className="camera-stage">
@@ -2501,6 +2817,19 @@ export default function Home() {
             >
               <span>{faceBox ? "Face tracked" : "Look toward the camera"}</span>
             </div>
+            {bodyRegions.map((region, index) => (
+              <div
+                key={index}
+                className="breathing-region"
+                style={{
+                  left: `${((320 - region.x - region.width) / 320) * 100}%`,
+                  top: `${(region.y / 240) * 100}%`,
+                  width: `${(region.width / 320) * 100}%`,
+                  height: `${(region.height / 240) * 100}%`,
+                }}
+                aria-hidden="true"
+              />
+            ))}
             {developerMode && (
               <div className="developer-label">
                 Amplified green change · green ↑ · purple ↓
@@ -2510,55 +2839,96 @@ export default function Home() {
           <canvas ref={workCanvasRef} width="320" height="240" hidden />
 
           <div className="reading-panel">
-            <div
-              key={beatSync.revision}
-              className={`heart-pulse ${bpm && monitoring ? "active" : ""}`}
-              style={{
-                animationDuration: bpm ? `${60 / bpm}s` : "1s",
-                animationDelay: bpm ? `-${beatSync.age}s` : "0s",
-              }}
-              title="Aligned to the estimated webcam pulse waveform"
-              aria-hidden="true"
-            >♥</div>
-            <Stack direction="row" spacing={2.5} sx={{ flexWrap: "wrap" }}>
-              <Stack direction="row" spacing={0.75} sx={{ alignItems: "baseline" }}>
-                <Typography variant="h3" sx={{ fontWeight: 800, color: "primary.main" }}>
-                  {bpm === null ? "--" : Math.round(bpm)}
-                </Typography>
-                <Typography color="text.secondary" sx={{ fontWeight: 800 }}>BPM</Typography>
-              </Stack>
-              <Stack direction="row" spacing={0.75} sx={{ alignItems: "baseline" }}>
-                <Typography variant="h4" sx={{ fontWeight: 800, color: "secondary.main" }}>
-                  {respiratoryRate === null ? "--" : Math.round(respiratoryRate)}
-                </Typography>
-                <Typography color="text.secondary" sx={{ fontWeight: 800 }}>breaths/min</Typography>
-              </Stack>
-            </Stack>
-            {calibrationSeconds !== null && (
-              <Card variant="outlined" sx={{ mt: 2, bgcolor: "#edf8f3", borderColor: "#b9d9cb" }}>
-                <CardContent>
-                  <Stack direction="row" sx={{ justifyContent: "space-between", alignItems: "baseline", mb: 1 }}>
-                    <Typography sx={{ fontWeight: 800, color: "primary.main" }}>Calibrating</Typography>
-                    <Typography sx={{ fontWeight: 800 }}>
-                      {calibrationSeconds} {calibrationSeconds === 1 ? "second" : "seconds"}
+            <Box className="vital-result-grid">
+              <Box className="vital-result primary-result">
+                <div
+                  key={beatSync.revision}
+                  className={`heart-pulse ${bpm && monitoring ? "active" : ""}`}
+                  style={{
+                    animationDuration: bpm ? `${60 / bpm}s` : "1s",
+                    animationDelay: bpm ? `-${beatSync.age}s` : "0s",
+                  }}
+                  title="Aligned to the estimated webcam pulse waveform"
+                  aria-hidden="true"
+                >♥</div>
+                <Box>
+                  <Typography variant="overline" color="text.secondary" sx={{ fontWeight: 800 }}>Pulse</Typography>
+                  <Stack direction="row" spacing={0.75} sx={{ alignItems: "baseline" }}>
+                    <Typography variant="h3" sx={{ fontWeight: 800, color: "primary.main" }}>
+                      {bpm === null ? "--" : Math.round(bpm)}
                     </Typography>
+                    <Typography color="text.secondary" sx={{ fontWeight: 800 }}>BPM</Typography>
                   </Stack>
-                  <LinearProgress
-                    variant="determinate"
-                    value={((INITIAL_CALIBRATION_SECONDS - calibrationSeconds) / INITIAL_CALIBRATION_SECONDS) * 100}
-                    sx={{ height: 8, borderRadius: 99 }}
-                  />
-                </CardContent>
-              </Card>
-            )}
-            <Typography color="text.secondary" sx={{ mt: 1.5 }} aria-live="polite">{status}</Typography>
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-              The breathing estimate needs about 30–40 seconds of still video. It is experimental and must not be
-              used to detect respiratory depression or emergencies.
+                </Box>
+              </Box>
+              <Box className="vital-result">
+                <Typography sx={{ fontSize: 34 }} aria-hidden="true">🫁</Typography>
+                <Box>
+                  <Typography variant="overline" color="text.secondary" sx={{ fontWeight: 800 }}>Breathing</Typography>
+                  <Stack direction="row" spacing={0.75} sx={{ alignItems: "baseline" }}>
+                    <Typography variant="h4" sx={{ fontWeight: 800, color: "secondary.main" }}>
+                      {respiratoryRate === null ? "--" : Math.round(respiratoryRate)}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary" sx={{ fontWeight: 800 }}>breaths/min</Typography>
+                  </Stack>
+                </Box>
+              </Box>
+            </Box>
+
+            <Card variant="outlined" className="measurement-progress" sx={{ bgcolor: measurementComplete ? "#edf8f3" : "#fff" }}>
+              <CardContent sx={{ p: { xs: 2.25, sm: 2.75 }, "&:last-child": { pb: { xs: 2.25, sm: 2.75 } } }}>
+                <Stack direction="row" spacing={2} sx={{ justifyContent: "space-between", alignItems: "flex-start", mb: 1.5 }}>
+                  <Box>
+                    <Typography variant="h6" sx={{ fontWeight: 800 }}>
+                      {measurementComplete ? "Measurement complete" : measurementSeconds < INITIAL_CALIBRATION_SECONDS ? "Finding your pulse" : "Confirming your result"}
+                    </Typography>
+                    <Typography color="text.secondary">
+                      {measurementComplete
+                        ? respirationStatus.startsWith("Pulse complete")
+                          ? "Your pulse is ready. Keep still briefly while breathing rate is checked."
+                          : respiratoryRate === null
+                          ? "Your pulse is ready to save. Breathing rate could not be confirmed."
+                          : "Your pulse and experimental breathing estimate are ready to save."
+                        : calibrationSeconds !== null
+                          ? `Pulse estimate in about ${calibrationSeconds} seconds. Keep still.`
+                          : "Pulse found. Keep your shoulders visible while breathing tracking builds."}
+                    </Typography>
+                  </Box>
+                  <Box sx={{ textAlign: "right", flexShrink: 0 }}>
+                    <Typography variant="h5" sx={{ fontWeight: 800, color: "primary.main" }}>
+                      {measurementComplete ? "Done" : `${Math.max(0, FINAL_MEASUREMENT_SECONDS - measurementSeconds)}s`}
+                    </Typography>
+                    {!measurementComplete && <Typography variant="caption" color="text.secondary">remaining</Typography>}
+                  </Box>
+                </Stack>
+                <LinearProgress
+                  variant="determinate"
+                  value={(measurementSeconds / FINAL_MEASUREMENT_SECONDS) * 100}
+                  color={measurementComplete ? "success" : "primary"}
+                  sx={{ height: 12, borderRadius: 99 }}
+                />
+                <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ mt: 1.5, alignItems: { sm: "center" } }}>
+                  {signalQuality !== null && (
+                    <Chip
+                      size="small"
+                      color={signalQuality >= 0.45 ? "success" : "warning"}
+                      label={`Pulse signal: ${signalQuality >= 0.45 ? "strong" : "acceptable"}`}
+                      sx={{ fontWeight: 800, alignSelf: "flex-start" }}
+                    />
+                  )}
+                  <Typography variant="body2" color="text.secondary" aria-live="polite">{status}</Typography>
+                </Stack>
+              </CardContent>
+            </Card>
+            <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 2 }}>
+              Breathing rate is experimental. Do not use it to detect respiratory depression or emergencies.
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 0.75 }} aria-live="polite">
+              {respirationStatus}
             </Typography>
           </div>
 
-          <Stack direction="row" spacing={1.5} sx={{ width: "min(calc(100% - 32px), 760px)", mx: "auto", mt: 0.5 }}>
+          <Stack direction={{ xs: "column", sm: "row" }} spacing={1.5} sx={{ width: "min(calc(100% - 32px), 760px)", mx: "auto", mt: 2 }}>
             {monitoring ? (
               <Button variant="contained" color="error" fullWidth size="large" onClick={stopCamera}>
                 Stop measurement
@@ -2566,7 +2936,15 @@ export default function Home() {
             ) : (
               <Button variant="contained" fullWidth size="large" onClick={startCamera}>Start again</Button>
             )}
-            <Button variant="outlined" fullWidth size="large" onClick={saveReading}>Save measurement</Button>
+            <Button
+              variant="outlined"
+              fullWidth
+              size="large"
+              onClick={saveReading}
+              disabled={!measurementComplete || bpm === null || signalQuality === null || respirationStatus.startsWith("Pulse complete")}
+            >
+              {measurementComplete ? "Save final result" : "Complete 60 seconds to save"}
+            </Button>
           </Stack>
           <Button
             onClick={toggleDeveloperMode}
@@ -2631,9 +3009,9 @@ export default function Home() {
       {screen === "medicine" && (
         <section className="medications-screen">
           <Stack direction="row" className="topbar" sx={{ alignItems: "center", justifyContent: "space-between" }}>
-            <Button color="inherit" onClick={() => navigate("vitals")}>← Log Vitals</Button>
-            <Typography sx={{ fontWeight: 800 }}>Log Medicine</Typography>
-            <Button color="inherit" onClick={() => navigate("data")}>My Data</Button>
+            <Button color="inherit" onClick={() => navigate("vitals")}>← Today</Button>
+            <Typography sx={{ fontWeight: 800 }}>Medicines</Typography>
+            <Button color="inherit" onClick={() => navigate("data")}>Records</Button>
           </Stack>
           <Container maxWidth="sm" sx={{ pt: 4, pb: 14 }}>
             <Typography variant="overline" color="primary" sx={{ display: "block", fontWeight: 800 }}>
@@ -3031,9 +3409,9 @@ export default function Home() {
       {screen === "data" && (
         <section className="history-screen">
           <Stack direction="row" className="topbar" sx={{ alignItems: "center", justifyContent: "space-between" }}>
-            <Button color="inherit" onClick={() => navigate("vitals")}>← Log Vitals</Button>
-            <Typography sx={{ fontWeight: 800 }}>My Data</Typography>
-            <Button color="inherit" onClick={() => navigate("medicine")}>Log Medicine</Button>
+            <Button color="inherit" onClick={() => navigate("vitals")}>← Today</Button>
+            <Typography sx={{ fontWeight: 800 }}>Records</Typography>
+            <Button color="inherit" onClick={() => navigate("medicine")}>Medicines</Button>
           </Stack>
           <Container maxWidth="sm" sx={{ pt: 4, pb: 14 }}>
             <Typography variant="h4" sx={{ fontWeight: 800, letterSpacing: "-0.03em", mb: 1 }}>
